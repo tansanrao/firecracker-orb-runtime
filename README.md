@@ -137,6 +137,8 @@ Set these in the provider's environment: run `systemctl --user edit fc-orb-provi
 | `FC_ORB_DISK_GIB` | `64` | Root disk size for orbs created afterwards. The file is sparse. |
 | `FC_ORB_CPU_OVERCOMMIT` | `4` | Running orbs may have this many times the host's CPUs in vCPUs. Each orb is capped at its own vCPUs. |
 | `FC_ORB_CPUSET` | all | Host CPUs orbs run on, such as `0-15`. By default they use every thread, performance and efficiency cores alike. |
+| `FC_ORB_JOB_SECONDS` | `270` | How long a job may take. Amp allows five minutes. |
+| `FC_ORB_SNAPSHOT_DAYS` | `14` | Project snapshots no new orb has used for this many days are deleted. `fc-orbd` reads this one: set it with `sudo systemctl edit fc-orbd`. |
 | `ORB_IMAGE` | Amp's orb image | The image new orbs boot from. |
 
 If you add orb types to the provider in Amp's settings, the names `small` (2 vCPUs, 4 GiB), `medium` (4, 8), `large`
@@ -167,8 +169,12 @@ Then delete the provider under **Settings → Orbs**.
   dropped. One 8 GiB orb takes about 5 s; four at once took about 20 s each.
 - **A portal does not wake a sleeping orb.** Amp answers the request itself and sends no job. Send the thread a
   message to wake it.
-- **Nothing is cleaned up.** Base disks of old images and unused project snapshots stay in `/var/lib/fc-orbs`. An
-  orb's disk keeps the size it was created with.
+- **Orbs stay until their thread is deleted.** Amp sends no job when a thread is archived, so a paused orb keeps its
+  disk. Clean-up removes only what no orb uses: see [State](docs/design.md#state). An orb's disk keeps the size it
+  was created with.
+- **The first spawn of a new image can fail.** Pulling Amp's image and building its disk takes longer than a job may.
+  The build keeps going, and starting the orb again once it is done works. `./fc-orb setup` prepares the default
+  image ahead of time.
 - **Open connections do not survive a long sleep.** Processes resume, but the other end of a TCP connection will have
   hung up.
 - **Untested:** Amp saving and reusing a project snapshot, and stopping the provider during a job.

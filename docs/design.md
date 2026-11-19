@@ -65,6 +65,16 @@ running orb as it stops, and only then are the orb units killed.
 
 Every job takes a per-orb lock and is safe to repeat.
 
+Amp gives a job five minutes, and every step of one waits only for what is left of `FC_ORB_JOB_SECONDS` (270 s): the
+locks, the Firecracker API, and the guest agent. A job out of time fails, and what it leaves the next job can use:
+
+- A pause keeps 60 s for what follows the snapshot. If the snapshot is not written by then, it kills Firecracker and
+  stops the orb with its disk, which the `sync` in step 1 brought up to date; the next spawn boots from it.
+- A spawn whose boot does not finish stops Firecracker, so the next one boots again rather than resuming a guest
+  that never started.
+- Pulling a new image and building its base disk runs in a unit of its own, `fc-orb-image-<hash>.service`. The spawn
+  waits for it while it has a minute to spare, then fails; the build carries on and a later spawn uses it.
+
 ## State
 
 Everything is in `/var/lib/fc-orbs`:
@@ -84,6 +94,16 @@ jail/firecracker/<orb id>/root/                 the orb's chroot, owned by its u
 Orb images are pulled with root's Podman. A base disk is the output of `podman export` written into a sparse ext4 file with `mkfs.ext4 -d`, plus the guest files.
 Its directory name includes a hash of those files and the disk size, so a runtime that changes either builds a new
 base disk and leaves existing orbs alone. Disks are copied with `cp --reflink=auto`.
+
+Every hour, and on `./fc-orb gc`, `fc-orbd` deletes what no orb uses and no spawn will:
+
+- base disks whose image is no longer tagged in Podman, or that hold older guest files;
+- dangling Podman images, left when a pull replaces a tag;
+- project snapshots no new orb was created from in `FC_ORB_SNAPSHOT_DAYS` (14), counted from when one last was;
+- the staging directories of an interrupted build or save.
+
+An orb's disk is its own copy, so this never changes an orb. Each start of an orb also trims its `console.log` and
+`fc.log` to their last MiB once either passes 4 MiB.
 
 ## The guest
 
@@ -227,7 +247,7 @@ kernels in Firecracker's CI bucket, which have no release channel or checksum.
 
 ## What was tested
 
-`scripts/smoke-test.sh` makes 24 checks. Across a pause it confirms the same kernel boot ID, the same PID still
+`scripts/smoke-test.sh` makes 26 checks. Across a pause it confirms the same kernel boot ID, the same PID still
 counting, working network, and a correct clock. It also covers repeated jobs, project snapshots, isolation between
 orbs, and booting from disk when a memory snapshot cannot be loaded.
 
@@ -251,3 +271,15 @@ LAN, Tailscale, or veth addresses. Jailing adds about 0.1 s to a wake (0.5 s ins
 Killing the provider with `SIGKILL` gets it
 restarted by systemd. After the kill, the new provider waited 50 s for Amp to drop the old connection before taking
 jobs.
+
+Deadlines, with `FC_ORB_JOB_SECONDS` lowered to force each case:
+
+- A spawn waiting on a held orb lock failed after 5.08 s.
+- A pause with a second left for the snapshot stopped the orb with its disk and exited 0 within 2 s. The next spawn
+  booted from disk with the files written before the pause.
+- A new orb whose cold boot ran out of time left no Firecracker running, and the next spawn booted it.
+- The first spawn of `debian:stable-slim` failed while the image was still pulling. The build finished in its unit,
+  and the next spawn booted from it in 1.4 s.
+
+`./fc-orb gc` deleted the base disk of an untagged image and one built with other guest files, a project snapshot
+untouched for 20 days, and a leftover staging directory. It kept the current base disk and a fresh snapshot.

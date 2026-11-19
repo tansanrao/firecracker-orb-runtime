@@ -16,6 +16,8 @@ Usage: fc-orb <command>
                         Run a bash script inside a running orb.
   console <orb>         Print the orb's serial console and Firecracker log.
   pause-all             Snapshot and stop every running orb.
+  gc                    Delete unused base disks, images, and project snapshots now. fc-orbd
+                        also does this every hour.
   destroy               Delete ALL orbs, disks, and snapshots, and uninstall the runtime.
 EOF
 }
@@ -31,7 +33,7 @@ orbctl() { sudo --non-interactive "$ORBCTL" "$@"; }
 # What orbctl may receive from the provider's environment. sudo drops every
 # other variable.
 JOB_VARIABLES="ORB_OPERATION ORB_ID ORB_IMAGE ORB_SNAPSHOT_ID ORB_TYPE ORB_TOKEN AMP_URL \
-FC_ORB_VCPUS FC_ORB_MEM_MIB FC_ORB_MEM_RESERVE_MIB FC_ORB_MEM_OVERCOMMIT FC_ORB_CPU_OVERCOMMIT FC_ORB_DISK_GIB FC_ORB_CPUSET FC_ORB_BOOTSTRAP_CMD"
+FC_ORB_VCPUS FC_ORB_MEM_MIB FC_ORB_MEM_RESERVE_MIB FC_ORB_MEM_OVERCOMMIT FC_ORB_CPU_OVERCOMMIT FC_ORB_DISK_GIB FC_ORB_CPUSET FC_ORB_BOOTSTRAP_CMD FC_ORB_JOB_SECONDS FC_ORB_SNAPSHOT_DAYS"
 
 install_runtime() {
 	echo "[fc-orb] building the runtime (the first build compiles the guest kernel, about two minutes)"
@@ -133,7 +135,7 @@ EOF
 			echo "It starts when you log in. To start it at boot, run: loginctl enable-linger $USER"
 		fi
 		;;
-	list | pause-all)
+	list | pause-all | gc)
 		orbctl "$1"
 		;;
 	exec | console)

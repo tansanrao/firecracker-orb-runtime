@@ -86,12 +86,36 @@ class ApiError(OrbError):
     """Firecracker answered and refused the request, so it had no effect."""
 
 
+# When the Amp job running now must have finished, in time.monotonic()
+# seconds; None outside a job.
+job_deadline = None
+
+
+def time_left(wanted, keep=0):
+    """How long a step that wants `wanted` seconds may take, keeping `keep`
+    seconds of the job for the steps after it."""
+    if job_deadline is None:
+        return wanted
+    left = job_deadline - keep - time.monotonic()
+    if left <= 0:
+        raise OrbError("the job ran out of time")
+    return min(wanted, left)
+
+
 @contextlib.contextmanager
 def locked(name):
     lock_dir = STATE / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     with open(lock_dir / f"{name}.lock", "w") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                try:
+                    time.sleep(time_left(0.05))
+                except OrbError:
+                    raise OrbError(f"the job ran out of time waiting for the {name} lock") from None
         yield
 
 
@@ -143,11 +167,15 @@ def image_dir(image_id):
     runtime with another size or newer guest files builds a new disk and
     leaves existing orbs as they are.
     """
-    guest_files = hashlib.sha256()
-    for path in sorted(GUEST_FILES.iterdir()):
-        guest_files.update(path.name.encode() + b"\0" + path.read_bytes())
-    name = f"{image_id.removeprefix('sha256:')}-{guest_files.hexdigest()[:12]}-{disk_gib()}g"
+    name = f"{image_id.removeprefix('sha256:')}-{guest_files_digest()}-{disk_gib()}g"
     return STATE / "images" / name
+
+
+def guest_files_digest():
+    digest = hashlib.sha256()
+    for path in sorted(GUEST_FILES.iterdir()):
+        digest.update(path.name.encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()[:12]
 
 
 def snapshot_dir(snapshot_id):
@@ -250,7 +278,7 @@ class Orb:
         return pid if is_ours else None
 
     def api(self, method, path, body=None, timeout=30):
-        connection = UnixHTTPConnection(str(self.api_socket), timeout)
+        connection = UnixHTTPConnection(str(self.api_socket), time_left(timeout))
         try:
             payload = None if body is None else json.dumps(body)
             connection.request(method, path, body=payload, headers={"Content-Type": "application/json"})
@@ -267,6 +295,7 @@ class Orb:
         # Close the descriptor the agent passed the script on, so that what
         # the script starts does not inherit the script text.
         payload = b'exec {ORB_SCRIPT_FD}<&-; unset ORB_SCRIPT_FD\n' + script.encode()
+        timeout = time_left(timeout)
         deadline = time.monotonic() + timeout
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(timeout)
@@ -322,9 +351,21 @@ def link_kernel(orb):
         shutil.copyfile(KERNEL, target)
 
 
-def unit_active(orb):
-    result = subprocess.run(["systemctl", "is-active", "--quiet", orb.unit])
+def unit_active(unit):
+    result = subprocess.run(["systemctl", "is-active", "--quiet", unit])
     return result.returncode == 0
+
+
+def trim_log(path, keep=2**20):
+    """Keeps the last `keep` bytes of a log that every start of an orb appends to."""
+    with contextlib.suppress(FileNotFoundError), open(path, "r+b") as handle:
+        size = handle.seek(0, os.SEEK_END)
+        if size > 4 * keep:
+            handle.seek(size - keep)
+            tail = handle.read()
+            handle.seek(0)
+            handle.write(tail)
+            handle.truncate()
 
 
 def start_firecracker(orb):
@@ -345,6 +386,8 @@ def start_firecracker(orb):
     for stale in (orb.api_socket, orb.vsock, orb.root / "firecracker.pid", orb.root / "firecracker"):
         stale.unlink(missing_ok=True)
     link_kernel(orb)
+    for path in (orb.dir / "console.log", orb.root / "fc.log"):
+        trim_log(path)
     (orb.root / "fc.log").touch()
     give_to_orb(orb, orb.root / "fc.log")
     # A unit that failed earlier would block starting one of the same name.
@@ -392,7 +435,7 @@ def start_firecracker(orb):
             orb.api("GET", "/")
             return
         except OSError as error:
-            if time.monotonic() > deadline or (orb.pid() is None and not unit_active(orb)):
+            if time.monotonic() > deadline or (orb.pid() is None and not unit_active(orb.unit)):
                 raise OrbError(
                     f"Firecracker did not start; see `journalctl -u {orb.unit}` and {orb.root}/fc.log"
                 ) from error
@@ -400,11 +443,11 @@ def start_firecracker(orb):
 
 
 def stop_firecracker(orb):
-    if orb.pid() is None and not unit_active(orb):
+    if orb.pid() is None and not unit_active(orb.unit):
         return
     subprocess.run(["systemctl", "kill", "--signal=SIGKILL", orb.unit], capture_output=True)
     deadline = time.monotonic() + 10
-    while orb.pid() is not None or unit_active(orb):
+    while orb.pid() is not None or unit_active(orb.unit):
         if time.monotonic() > deadline:
             raise OrbError(f"{orb.unit} did not stop")
         time.sleep(0.01)
@@ -490,6 +533,7 @@ def create(orb):
     snapshot_id = os.environ.get("ORB_SNAPSHOT_ID", "")
     if snapshot_id and (snapshot_dir(snapshot_id) / "rootfs.ext4").exists():
         source = snapshot_dir(snapshot_id)
+        os.utime(source)  # garbage collection deletes snapshots unused for a while
         log(f"creating {orb.id} from project snapshot {snapshot_id}")
     else:
         image = os.environ.get("ORB_IMAGE") or DEFAULT_IMAGE
@@ -756,7 +800,13 @@ def spawn(orb):
             if orb.snapshot_marker.exists() and restore(orb):
                 how = "restored from memory snapshot"
             else:
-                cold_boot(orb)
+                try:
+                    cold_boot(orb)
+                except (OrbError, OSError):
+                    # Otherwise the next spawn finds a Firecracker that never
+                    # booted its guest and only resumes it.
+                    stop_firecracker(orb)
+                    raise
                 how = "booted from disk"
     prepare_guest(orb)
     bootstrap(orb)
@@ -802,13 +852,19 @@ def make_durable(orb, snapshot):
     fsync(snapshot)
 
 
+# What a pause needs after Firecracker has written the snapshot: stopping it,
+# dropping the snapshot's unused pages, and syncing the rest. A snapshot that
+# cannot be written by then is abandoned, and the orb is stopped with its disk.
+PAUSE_FINISH_SECONDS = 60
+
+
 def pause(orb):
     started = time.monotonic()
     if orb.pid() is not None:
         # Flush the guest's page cache, so the disk alone (a project snapshot,
         # or a boot after a failed restore) holds everything written so far.
         with contextlib.suppress(OSError, OrbError):
-            orb.run_in_guest("sync", timeout=60)
+            orb.run_in_guest("sync", timeout=time_left(60, keep=PAUSE_FINISH_SECONDS))
         staging = orb.root / "snap.new"
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir()
@@ -828,7 +884,7 @@ def pause(orb):
                     # Synced below, after the unused pages are dropped.
                     "sync_snapshot_files": False,
                 },
-                timeout=270,
+                timeout=time_left(270, keep=PAUSE_FINISH_SECONDS),
             )
             stop_firecracker(orb)
             make_durable(orb, staging)
@@ -873,9 +929,21 @@ def all_orbs():
 
 
 def command_job(arguments):
+    global job_deadline
+    # Amp gives a job five minutes; the default leaves the rest for the
+    # provider and sudo.
+    job_deadline = time.monotonic() + float(os.environ.get("FC_ORB_JOB_SECONDS") or 270)
     orb = Orb(os.environ["ORB_ID"])
     with locked(orb.id):
         {"spawn": spawn, "pause": pause, "delete": delete}[arguments.command](orb)
+
+
+def prepared_image(image):
+    """The ID of an image the host has pulled and built a base disk for, else None."""
+    if subprocess.run(["podman", "image", "exists", image]).returncode != 0:
+        return None
+    image_id = run("podman", "image", "inspect", "--format", "{{.Id}}", image).strip()
+    return image_id if (image_dir(image_id) / "rootfs.ext4").exists() else None
 
 
 def ensure_image(image):
@@ -884,6 +952,40 @@ def ensure_image(image):
     Pulls the image with Podman only when the host does not have it, so an
     image is never updated behind existing orbs; `podman pull` updates it.
     """
+    image_id = prepared_image(image)
+    if image_id:
+        return image_id
+    if job_deadline is None:
+        return prepare_image(image)
+    # A first pull and build may take longer than a job can, so it runs in a
+    # unit of its own that keeps going when this job stops waiting, and a
+    # later spawn uses what it built.
+    unit = f"fc-orb-image-{hashlib.sha256(image.encode()).hexdigest()[:12]}.service"
+    if not unit_active(unit):
+        subprocess.run(["systemctl", "reset-failed", unit], capture_output=True)
+        settings = (f"--setenv={name}={value}" for name, value in os.environ.items() if name.startswith("FC_ORB_"))
+        try:
+            run("systemd-run", "--quiet", "--unit", unit, *settings,
+                sys.executable, os.path.abspath(__file__), "prepare-image", image)
+        except OrbError:
+            if not unit_active(unit):  # else another job started it first
+                raise
+    log(f"pulling {image} and building its root disk in {unit}")
+    while unit_active(unit):
+        try:
+            # Keep enough of the job to create and boot the orb afterwards.
+            time.sleep(time_left(1, keep=60))
+        except OrbError:
+            raise OrbError(
+                f"{image} is still being prepared (see `journalctl -u {unit}`); start the orb again once it is done"
+            ) from None
+    image_id = prepared_image(image)
+    if not image_id:
+        raise OrbError(f"preparing {image} failed; see `journalctl -u {unit}`")
+    return image_id
+
+
+def prepare_image(image):
     with locked("images"):
         if subprocess.run(["podman", "image", "exists", image]).returncode != 0:
             log(f"pulling {image}")
@@ -1042,6 +1144,49 @@ def relieve_pressure():
     return asked
 
 
+def collect_garbage():
+    """Deletes what no orb uses and no spawn will: base disks of images the
+    host no longer has, or that hold older guest files; dangling images;
+    project snapshots no spawn has used in FC_ORB_SNAPSHOT_DAYS; and what
+    an interrupted build left behind.
+
+    Orbs keep their own disks: each is a copy of its base disk or snapshot,
+    so deleting those leaves every orb as it is. Orbs themselves stay until
+    Amp deletes them.
+    """
+    freed = 0
+
+    def remove(path, why):
+        nonlocal freed
+        usage = subprocess.run(["du", "-s", "--block-size=1", str(path)], capture_output=True, text=True).stdout
+        shutil.rmtree(path, ignore_errors=True)
+        freed += int(usage.split()[0]) if usage else 0
+        log(f"deleted {path} ({why})")
+
+    with locked("images"):
+        tagged = {line.removeprefix("sha256:") for line in run(
+            "podman", "images", "--no-trunc", "--filter", "dangling=false", "--format", "{{.ID}}"
+        ).split()}
+        for path in (STATE / "images").iterdir():
+            image_id, _, rest = path.name.partition("-")
+            if path.name.endswith(".tmp"):
+                remove(path, "left by an interrupted build")
+            elif image_id not in tagged:
+                remove(path, "its image is no longer tagged")
+            elif not rest.startswith(guest_files_digest() + "-"):
+                remove(path, "built with older guest files")
+        run("podman", "image", "prune", "--force")
+    days = float(os.environ.get("FC_ORB_SNAPSHOT_DAYS") or 14)
+    with locked("snapshots"):
+        for path in (STATE / "snapshots").iterdir():
+            if path.name.endswith(".tmp"):
+                remove(path, "left by an interrupted save")
+            elif time.time() - path.stat().st_mtime > days * 86400:
+                remove(path, f"no orb was created from it in {days:g} days")
+    if freed:
+        log(f"garbage collection freed {freed / 2**30:.1f} GiB")
+
+
 def command_serve(arguments):
     """fc-orbd's main process: relieves memory pressure, and when the service
     stops, snapshots running orbs.
@@ -1060,7 +1205,14 @@ def command_serve(arguments):
     for directory in ("orbs", "images", "snapshots", "jail"):
         (STATE / directory).mkdir(parents=True, exist_ok=True)
     log("runtime ready")
+    next_collection = 0
     while True:
+        if time.monotonic() >= next_collection:
+            try:
+                collect_garbage()
+            except (OrbError, OSError) as error:
+                log(f"garbage collection failed: {error}")
+            next_collection = time.monotonic() + 3600
         # Reported pages reach the host at about 250 MiB/s, so after asking,
         # wait for them before judging whether more is needed.
         time.sleep(30 if relieve_pressure() else 5)
@@ -1086,6 +1238,9 @@ def main():
     console.set_defaults(run=command_console)
     commands.add_parser("pause-all", help="pause every running orb").set_defaults(run=command_pause_all)
     commands.add_parser("delete-all", help="delete every orb and its disk").set_defaults(run=command_delete_all)
+    commands.add_parser("gc", help="delete unused base disks, images, and project snapshots").set_defaults(
+        run=lambda arguments: collect_garbage()
+    )
     commands.add_parser("serve", help="fc-orbd's main process").set_defaults(run=command_serve)
 
     arguments = parser.parse_args()
