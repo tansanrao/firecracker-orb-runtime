@@ -143,8 +143,10 @@ Then delete the provider under **Settings → Orbs**.
 
 - **One trusted user.** Firecracker runs as root in a container, without its jailer and without per-orb CPU or I/O
   limits. Do not run untrusted code or other people's threads on it.
-- **Running orbs do not return memory.** Each one can grow to its full size on the host until it pauses, so a spawn
-  counts every running orb at its full size and fails when the host could not hold them all. The thread's setup log
+- **Running orbs return freed memory, but not their page cache.** After a process in an orb exits, the host gets its
+  memory back at about 250 MiB/s, but files the orb has read stay cached on the host until it pauses. Orbs started
+  before this was added get it on their next boot from disk. An orb can grow back to its full size at any time, so a
+  spawn counts every running orb at its full size and fails when the host could not hold them all. The thread's setup log
   shows how much memory was missing. Archiving idle threads pauses their orbs and frees it.
 - **Pause time follows configured memory.** Firecracker writes all of an orb's memory before the unused part is
   dropped. One 8 GiB orb takes about 5 s; four at once took about 20 s each.

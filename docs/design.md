@@ -98,7 +98,22 @@ single-thread speed, and it keeps the CPU type the same between snapshot and res
 
 ## Host memory
 
-A guest never gives memory back, so a running orb can grow to its configured size. Before Firecracker starts, spawn
+Every orb booted from disk has Firecracker's balloon device with free page reporting, inflated to 0 MiB. The guest
+reports the memory it frees, and Firecracker releases it with `MADV_DONTNEED`. The guest reports about 512 MiB every
+2 s. In a cold-booted orb, 3 GiB freed by a process was back on the host within 14 s. In a restored orb, a reported
+page reads the snapshot file's old contents again instead of zeros. The guest makes no assumption about free pages,
+and a 1 GiB checksummed buffer survived freeing memory and two pause and restore cycles.
+
+Page cache is not free memory, so it is not reported and stays on the host until the orb pauses. Dropping caches at
+pause does not help, because reporting is slower than writing the pages into the snapshot. DAMON_RECLAIM (in the guest
+kernel) freed cold cache unevenly in testing: 1 GiB, then a stall of a minute or more.
+
+Pause time still follows configured memory, because a full snapshot reads all of guest memory. A diff snapshot without
+dirty page tracking writes the pages `mincore` reports as resident. For a restored orb that is every page of the
+snapshot file in the host's page cache, so it wrote all 8 GiB and was slower than a full snapshot. KVM dirty page
+tracking would make diffs exact. It is a developer preview in Firecracker v1.18 and costs CPU in every running orb.
+
+A running orb can grow back to its configured size at any time. Before Firecracker starts, spawn
 adds the new orb's size to what every running orb has not used yet: its configured size minus Firecracker's `RssAnon`,
 which is the guest memory it has written. If that sum, plus `FC_ORB_MEM_RESERVE_MIB` (a tenth of RAM by default), is
 more than the host's `MemAvailable`, the spawn fails with the numbers and leaves the orb's snapshot as it was.

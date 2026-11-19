@@ -433,6 +433,14 @@ def cold_boot(orb):
     )
     orb.api("PUT", "/vsock", {"guest_cid": 3, "uds_path": str(orb.vsock)})
     orb.api("PUT", "/entropy", {})
+    # The guest reports memory it frees, and Firecracker hands it back to the
+    # host. Without this, an orb keeps every page it ever touched until it
+    # pauses, and its snapshot keeps them too.
+    orb.api(
+        "PUT",
+        "/balloon",
+        {"amount_mib": 0, "deflate_on_oom": False, "stats_polling_interval_s": 0, "free_page_reporting": True},
+    )
     orb.api("PUT", "/actions", {"action_type": "InstanceStart"})
     orb.wait_for_agent()
 
@@ -531,12 +539,19 @@ def meminfo():
     return fields
 
 
+def written_mib(pid):
+    """Guest memory a Firecracker process holds on the host: what the guest
+    has written. Pages a restored guest only read stay in the page cache."""
+    status = Path(f"/proc/{pid}/status").read_text()
+    return int(re.search(r"^RssAnon:\s+(\d+)", status, re.M).group(1)) // 1024
+
+
 def admit(orb):
     """Refuses to start an orb unless the host can hold all of its memory.
 
-    A running orb never returns memory, so each can still grow to its full
-    size: what it has not written yet (Firecracker's anonymous memory) is
-    counted as taken. Starting orbs past that point would let the host's OOM
+    A running orb can grow to its full size at any time, even after handing
+    memory back: what it does not hold now (Firecracker's anonymous memory)
+    is counted as taken. Starting orbs past that point would let the host's OOM
     killer pick an orb, the provider, or dockerd once they grow.
     """
     host = meminfo()
@@ -547,9 +562,7 @@ def admit(orb):
         if pid is None or other.id == orb.id:
             continue
         with contextlib.suppress(OSError, ValueError):
-            status = Path(f"/proc/{pid}/status").read_text()
-            written = int(re.search(r"^RssAnon:\s+(\d+)", status, re.M).group(1)) // 1024
-            growth += max(other.config["memory_mib"] - written, 0)
+            growth += max(other.config["memory_mib"] - written_mib(pid), 0)
     needed = orb.config["memory_mib"]
     if needed + growth + reserve > host["MemAvailable"]:
         raise OrbError(
