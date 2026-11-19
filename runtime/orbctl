@@ -680,29 +680,43 @@ def written_mib(pid):
     return int(re.search(r"^RssAnon:\s+(\d+)", status, re.M).group(1)) // 1024
 
 
-def admit(orb):
-    """Refuses to start an orb unless the host can hold all of its memory.
+def reserve_mib(host):
+    """Memory kept free for the host before orbs count as crowding it."""
+    return int(os.environ.get("FC_ORB_MEM_RESERVE_MIB") or host["MemTotal"] // 10)
 
-    A running orb can grow to its full size at any time, even after handing
-    memory back: what it does not hold now (Firecracker's anonymous memory)
-    is counted as taken. Starting orbs past that point would let the host's OOM
-    killer pick an orb, the provider, or dockerd once they grow.
+
+def admit(orb):
+    """Refuses to start an orb past the host's memory overcommit limit.
+
+    Orbs may be configured for up to FC_ORB_MEM_OVERCOMMIT (2) times RAM in
+    total, less what the rest of the host uses: the desktop, libvirt VMs,
+    and the reserve. They are also kept within RAM plus swap, so that if
+    every orb grew to its full size at once, swap would absorb it instead
+    of the OOM killer. Most orbs use a fraction of their size, and free page
+    reporting and the pressure loop in fc-orbd hand back what they free.
     """
     host = meminfo()
-    reserve = int(os.environ.get("FC_ORB_MEM_RESERVE_MIB") or host["MemTotal"] // 10)
-    growth = 0
+    ratio = float(os.environ.get("FC_ORB_MEM_OVERCOMMIT") or 2)
+    reserve = reserve_mib(host)
+    committed = orbs_resident = 0
     for other in all_orbs():
         pid = other.pid()
         if pid is None or other.id == orb.id:
             continue
+        committed += other.config["memory_mib"]
         with contextlib.suppress(OSError, ValueError):
-            growth += max(other.config["memory_mib"] - written_mib(pid), 0)
+            orbs_resident += written_mib(pid)
+    # What the rest of the host uses right now, measured, not configured.
+    others = max(host["MemTotal"] - host["MemAvailable"] - orbs_resident, 0)
+    limit = min(ratio * host["MemTotal"], host["MemTotal"] + host["SwapTotal"] - reserve) - others
     needed = orb.config["memory_mib"]
-    if needed + growth + reserve > host["MemAvailable"]:
+    if committed + needed > limit:
         raise OrbError(
-            f"not enough host memory to start {orb.id}: it needs {needed} MiB and running orbs can still grow by "
-            f"{growth} MiB, but the host has {host['MemAvailable']} MiB available and keeps {reserve} MiB for "
-            "itself (FC_ORB_MEM_RESERVE_MIB). Archive threads you are done with, or wait for idle orbs to pause."
+            f"not enough host memory to start {orb.id}: it needs {needed} MiB and running orbs are configured for "
+            f"{committed} MiB, but orbs may have {int(limit)} MiB in total while the rest of the host uses "
+            f"{others} MiB (FC_ORB_MEM_OVERCOMMIT {ratio:g}x of {host['MemTotal']} MiB RAM, at most RAM plus "
+            f"{host['SwapTotal']} MiB swap less a {reserve} MiB reserve). Archive threads you are done with, "
+            "or wait for idle orbs to pause."
         )
 
 
@@ -712,12 +726,18 @@ def spawn(orb):
         orb.api("PATCH", "/vm", {"state": "Resumed"})  # in case a pause was interrupted
         how = "was already running"
     else:
-        if not orb.rootfs.exists():
+        created = not orb.rootfs.exists()
+        if created:
             create(orb)
         # Held until Firecracker runs, so concurrent spawns each count the
         # orbs the others start.
         with locked("memory"):
-            admit(orb)
+            try:
+                admit(orb)
+            except OrbError:
+                if created:  # leave no disk or network slot behind for a refused new orb
+                    delete(orb)
+                raise
             if orb.snapshot_marker.exists() and restore(orb):
                 how = "restored from memory snapshot"
             else:
@@ -964,8 +984,52 @@ def command_delete_all(arguments):
             delete(orb)
 
 
+GUEST_FILE_CACHE = "awk '/^(Active|Inactive)\\(file\\):/ { kib += $2 } END { print int(kib / 1024) }' /proc/meminfo"
+# Cache a guest keeps however hard the host is pressed: its hot binaries and libraries.
+GUEST_CACHE_FLOOR_MIB = 256
+
+
+def relieve_pressure():
+    """Asks guests to drop file cache when the host runs short of memory.
+
+    A guest keeps the files it read cached until it pauses, and that cache
+    is guest memory the host cannot reclaim. Without this, the host swaps
+    out orb memory, cache included, before any guest gives anything back.
+    The guest frees the cache through its cgroup's memory.reclaim, and free
+    page reporting returns the pages to the host over the next seconds.
+    Orbs with the most cache go first. Returns whether it asked any.
+    """
+    host = meminfo()
+    deficit = reserve_mib(host) - host["MemAvailable"]
+    if deficit <= 0:
+        return False
+    caches = []
+    for orb in all_orbs():
+        if orb.pid() is None:
+            continue
+        # No orb lock: a job may hold it, and a failed request here is harmless.
+        with contextlib.suppress(OSError, OrbError, ValueError):
+            code, output = orb.run_in_guest(GUEST_FILE_CACHE, timeout=5)
+            if code == 0:
+                caches.append((int(output), orb))
+    asked = False
+    for cached, orb in sorted(caches, key=lambda entry: entry[0], reverse=True):
+        amount = min(cached - GUEST_CACHE_FLOOR_MIB, deficit)
+        if deficit <= 0 or amount <= 0:
+            break
+        # The guest has no swap; swappiness=0 keeps reclaim to the cache anyway.
+        # The write fails with EAGAIN when it reclaims less than asked, which is fine.
+        with contextlib.suppress(OSError, OrbError):
+            orb.run_in_guest(f"echo '{amount}M swappiness=0' >/sys/fs/cgroup/memory.reclaim 2>/dev/null; :", timeout=30)
+            log(f"host has {host['MemAvailable']} MiB available; asked {orb.id} to drop {amount} MiB of file cache")
+            asked = True
+        deficit -= amount
+    return asked
+
+
 def command_serve(arguments):
-    """fc-orbd's main process: when the service stops, snapshots running orbs.
+    """fc-orbd's main process: relieves memory pressure, and when the service
+    stops, snapshots running orbs.
 
     Orb units are ordered before fc-orbd.service, so at shutdown systemd
     stops this first, and every orb is paused before its unit is killed.
@@ -982,7 +1046,9 @@ def command_serve(arguments):
         (STATE / directory).mkdir(parents=True, exist_ok=True)
     log("runtime ready")
     while True:
-        signal.pause()
+        # Reported pages reach the host at about 250 MiB/s, so after asking,
+        # wait for them before judging whether more is needed.
+        time.sleep(30 if relieve_pressure() else 5)
 
 
 def main():

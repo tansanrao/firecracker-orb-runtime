@@ -31,7 +31,7 @@ orbctl() { sudo --non-interactive "$ORBCTL" "$@"; }
 # What orbctl may receive from the provider's environment. sudo drops every
 # other variable.
 JOB_VARIABLES="ORB_OPERATION ORB_ID ORB_IMAGE ORB_SNAPSHOT_ID ORB_TYPE ORB_TOKEN AMP_URL \
-FC_ORB_VCPUS FC_ORB_MEM_MIB FC_ORB_MEM_RESERVE_MIB FC_ORB_DISK_GIB FC_ORB_CPUSET FC_ORB_BOOTSTRAP_CMD"
+FC_ORB_VCPUS FC_ORB_MEM_MIB FC_ORB_MEM_RESERVE_MIB FC_ORB_MEM_OVERCOMMIT FC_ORB_DISK_GIB FC_ORB_CPUSET FC_ORB_BOOTSTRAP_CMD"
 
 install_runtime() {
 	echo "[fc-orb] building the runtime (the first build compiles the guest kernel, about two minutes)"

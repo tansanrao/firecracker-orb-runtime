@@ -135,13 +135,37 @@ dirty page tracking writes the pages `mincore` reports as resident. For a restor
 snapshot file in the host's page cache, so it wrote all 8 GiB and was slower than a full snapshot. KVM dirty page
 tracking would make diffs exact. It is a developer preview in Firecracker v1.18 and costs CPU in every running orb.
 
-A running orb can grow back to its configured size at any time. Before Firecracker starts, spawn
-adds the new orb's size to what every running orb has not used yet: its configured size minus Firecracker's `RssAnon`,
-which is the guest memory it has written. If that sum, plus `FC_ORB_MEM_RESERVE_MIB` (a tenth of RAM by default), is
-more than the host's `MemAvailable`, the spawn fails with the numbers and leaves the orb's snapshot as it was.
-A restored orb's unwritten pages are file-backed page cache, so they count toward what it can still grow by, not
-toward what it uses. Spawns hold a lock from the check until the guest answers, so concurrent spawns each count the
-orbs the others start. Four new 8 GiB orbs spawned at once with 20 GiB of headroom started two and refused two.
+### Overcommit
+
+Orbs are overcommitted: their configured memory may add up to more than RAM, and swap absorbs what they use beyond
+it. Before Firecracker starts, spawn adds the new orb's size to the configured memory of the running orbs. The total
+must stay within
+
+```
+min(FC_ORB_MEM_OVERCOMMIT × RAM, RAM + swap − reserve) − what the rest of the host uses
+```
+
+`FC_ORB_MEM_OVERCOMMIT` is 2 and the reserve (`FC_ORB_MEM_RESERVE_MIB`) a tenth of RAM by default. What the rest of
+the host uses (the desktop, libvirt VMs) is measured at spawn: MemTotal − MemAvailable − the orbs' `RssAnon`. The
+second term means that if every orb grew to its full size at once, RAM and swap would still hold it. A refused spawn
+fails with the numbers, leaves a paused orb's snapshot as it was, and removes a new orb's disk. Spawns hold a lock
+from the check until the guest answers, so concurrent spawns each count the orbs the others start.
+
+On this host (61 GiB RAM, a 64 GiB swapfile with zswap, 18 GiB used by the rest of the host) the limit came to
+101 GiB: twelve 8 GiB orbs started and the thirteenth was refused. Each of the twelve then filled 4.5 GiB with random
+data, the worst case for zswap. The host swapped 32 GiB, with no OOM kill, and stayed responsive (40 ms for a short
+command). All twelve buffers' checksums were intact afterwards. Reading an orb's swapped memory back took about 17 s;
+pausing one took 41 s, because the snapshot reads its memory in. Swap use was higher than the orbs' data alone,
+because zswap kept random pages it could barely compress; real orb memory compresses better.
+
+### Pressure loop
+
+Every 5 s, `fc-orbd` compares the host's MemAvailable with the reserve. When it is short, it asks the guests holding
+the most file cache (`Active(file)` + `Inactive(file)`) to drop the difference, keeping 256 MiB each, through their
+root cgroup's `memory.reclaim`. Free page reporting returns the pages to the host, so it waits 30 s before asking
+again. That keeps the host from swapping out guest page cache, which would cost a disk write now and a read later.
+Asked for 5,000 MiB with three orbs holding 3 GiB of cache each, it took 2,869 and 2,131 MiB from the two largest, and
+the host had them back within 20 s.
 
 The check does not pause other orbs to make room. The runtime cannot tell an idle orb from one whose agent is
 waiting on a model, and Amp pauses idle orbs itself.
