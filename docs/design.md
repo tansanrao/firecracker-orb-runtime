@@ -208,8 +208,9 @@ frontend. In that orb:
   Chrome, and agent process.
 - Rebuilding the runtime under the running orb snapshotted it; the next message restored it with the same processes.
 
-Under the earlier Docker-based runtime, a host reboot kept four running orbs, each holding a 2 GiB process, with
-the same boot ID and process. The jailed runtime has not been through a reboot yet. Restarting `fc-orbd` paused a
+A host reboot kept four running jailed orbs, each holding a 2 GiB process, with the same boot ID and process. During
+shutdown `fc-orbd` paused them in 24 s, one at a time, before systemd went on. After boot, `fc-orbd` and the provider
+started on their own and each orb restored in about 0.5 s. Restarting `fc-orbd` paused a
 running orb and the next spawn restored it with the same boot ID and process. Orbs could not reach the host on its
 LAN, Tailscale, or veth addresses. Jailing adds about 0.1 s to a wake (0.5 s instead of 0.4 s).
 
