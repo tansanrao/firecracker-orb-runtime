@@ -1,44 +1,100 @@
 #!/usr/bin/env bash
 # Operator commands for the Firecracker orb runtime.
 set -euo pipefail
-source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
 
 usage() {
 	cat <<'EOF'
 Usage: fc-orb <command>
 
-  setup [image]         Build the runtime, (re)start it, and prepare the orb image's disk.
-                        Running orbs are paused first and wake on their next spawn.
+  setup [image]         Build Firecracker, the jailer, the guest kernel, and orb-agent, install
+                        them to /opt/fc-orb with sudo, start fc-orbd, and prepare the orb image's
+                        disk. Safe to run again after pulling changes.
   install-service       Run `amp orb provider` as a systemd user service that starts at boot
                         and restarts if it exits. Safe to run again after moving this directory.
-  install-shutdown-hook Install a system unit (with sudo) that pauses running orbs before
-                        Docker stops, at shutdown or on a Docker restart.
   list                  List orbs and whether each is running, paused, or stopped.
   exec [--user U] <orb> <script>
                         Run a bash script inside a running orb.
   console <orb>         Print the orb's serial console and Firecracker log.
   pause-all             Snapshot and stop every running orb.
-  destroy               Remove the runtime container and ALL orbs, disks, and snapshots.
+  destroy               Delete ALL orbs, disks, and snapshots, and uninstall the runtime.
 EOF
 }
 
-DEFAULT_ORB_IMAGE=us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+INSTALL=/opt/fc-orb
+ORBCTL="$INSTALL/bin/orbctl"
 PROVIDER_SERVICE=fc-orb-provider.service
-SHUTDOWN_SERVICE=fc-orb-pause-on-shutdown.service
+BUILD_IMAGE=localhost/fc-orb-build
+
+orbctl() { sudo --non-interactive "$ORBCTL" "$@"; }
+
+# What orbctl may receive from the provider's environment. sudo drops every
+# other variable.
+JOB_VARIABLES="ORB_OPERATION ORB_ID ORB_IMAGE ORB_SNAPSHOT_ID ORB_TYPE ORB_TOKEN AMP_URL \
+FC_ORB_VCPUS FC_ORB_MEM_MIB FC_ORB_MEM_RESERVE_MIB FC_ORB_DISK_GIB FC_ORB_CPUSET FC_ORB_BOOTSTRAP_CMD"
+
+install_runtime() {
+	echo "[fc-orb] building the runtime (the first build compiles the guest kernel, about two minutes)"
+	podman build --quiet --tag "$BUILD_IMAGE" "$ROOT/runtime" >/dev/null
+	local staging container
+	staging="$(mktemp -d)"
+	container="$(podman create "$BUILD_IMAGE" /none)"
+	mkdir "$staging/out"
+	for file in firecracker jailer vmlinux orb-agent; do
+		podman cp "$container:/$file" "$staging/out/$file"
+	done
+	podman rm "$container" >/dev/null
+
+	sudo install -d -m 0755 "$INSTALL" "$INSTALL/bin" "$INSTALL/guest"
+	sudo install -m 0755 "$staging/out/firecracker" "$staging/out/jailer" "$ROOT/runtime/orbctl" "$INSTALL/bin/"
+	sudo install -m 0644 "$staging/out/vmlinux" "$INSTALL/vmlinux"
+	sudo install -m 0755 "$staging/out/orb-agent" "$ROOT/runtime/guest/orb-init" "$INSTALL/guest/"
+	sudo install -m 0644 "$ROOT/runtime/guest/orb-agent.service" "$INSTALL/guest/"
+	rm -rf "$staging"
+
+	# Lets this user, and so the provider, run orbctl as root without a
+	# password, and nothing else.
+	local rule
+	rule="$(mktemp)"
+	cat >"$rule" <<EOF
+Defaults!$ORBCTL env_keep += "$JOB_VARIABLES"
+$USER ALL=(root) NOPASSWD: $ORBCTL
+EOF
+	sudo visudo --check --quiet --file "$rule"
+	sudo install -m 0440 "$rule" /etc/sudoers.d/fc-orb
+	rm -f "$rule"
+
+	# fc-orbd pauses running orbs when it stops, which is how orbs keep their
+	# memory across a reboot: orb units are ordered before it, so systemd
+	# stops it, and pauses them, before it kills them.
+	sudo tee /etc/systemd/system/fc-orbd.service >/dev/null <<EOF
+[Unit]
+Description=Firecracker orb runtime (pauses running orbs when it stops)
+Documentation=file://$ROOT/docs/design.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$ORBCTL serve
+TimeoutStopSec=900
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	sudo systemctl daemon-reload
+	sudo systemctl enable --quiet fc-orbd.service
+	# A running fc-orbd only waits for a stop signal, so it can keep running
+	# the old code: orbctl is read again for every job.
+	sudo systemctl start fc-orbd.service
+}
 
 case "${1:-}" in
 	setup)
-		build_runtime
-		wanted="$(docker image inspect --format '{{.Id}}' "$FC_ORB_RUNTIME_IMAGE")"
-		current="$(docker inspect --format '{{.Image}}' "$FC_ORB_CONTAINER" 2>/dev/null || true)"
-		if [[ -n "$current" && "$current" != "$wanted" ]]; then
-			# `docker stop` makes `orbctl serve` snapshot the running orbs.
-			docker stop "$FC_ORB_CONTAINER" >/dev/null
-			docker rm "$FC_ORB_CONTAINER" >/dev/null
-		fi
-		ensure_runtime
-		ensure_image "${2:-${ORB_IMAGE:-$DEFAULT_ORB_IMAGE}}" >/dev/null
-		echo "Runtime ready. Run the provider with: $FC_ORB_ROOT/fc-orb install-service"
+		install_runtime
+		orbctl prepare-image "${2:-${ORB_IMAGE:-us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest}}"
+		echo "Runtime ready. Run the provider with: $ROOT/fc-orb install-service"
 		;;
 	install-service)
 		amp="$(command -v amp)" || { echo "amp is not on PATH" >&2; exit 1; }
@@ -58,7 +114,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Environment="PATH=$(dirname "$amp"):/usr/local/bin:/usr/bin:/bin"
-ExecStart="$amp" orb provider "$FC_ORB_ROOT/dispatch.sh"
+ExecStart="$amp" orb provider "$ROOT/dispatch.sh"
 Restart=always
 RestartSec=5
 # On stop the provider waits for its running jobs, so signal only the provider
@@ -77,59 +133,21 @@ EOF
 			echo "It starts when you log in. To start it at boot, run: loginctl enable-linger $USER"
 		fi
 		;;
-	list)
-		ensure_runtime
-		orbctl list
+	list | pause-all)
+		orbctl "$1"
 		;;
-	exec)
+	exec | console)
+		command="$1"
 		shift
-		ensure_runtime
-		orbctl exec "$@"
-		;;
-	console)
-		ensure_runtime
-		docker exec "$FC_ORB_CONTAINER" sh -c 'cd "/var/lib/fc-orbs/orbs/$1" && cat console.log fc.log' sh "$2"
-		;;
-	pause-all)
-		# A stopped runtime has no running orbs. Starting it here would race
-		# a host shutdown, which is when the shutdown hook calls this.
-		if [[ "$(docker inspect --format '{{.State.Running}}' "$FC_ORB_CONTAINER" 2>/dev/null)" == true ]]; then
-			orbctl pause-all
-		fi
-		;;
-	install-shutdown-hook)
-		# Docker's unit gives dockerd 90 s to stop, and dockerd kills
-		# containers that take longer, so orbs that had not finished pausing
-		# would lose their memory. This system unit is ordered after
-		# docker.service, so systemd stops it, and pauses the orbs, before it
-		# stops Docker: at shutdown, and on every Docker restart or upgrade.
-		unit=/etc/systemd/system/$SHUTDOWN_SERVICE
-		sudo tee "$unit" >/dev/null <<EOF
-[Unit]
-Description=Pause Firecracker orbs before Docker stops
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=$USER
-ExecStart=/bin/true
-ExecStop="$FC_ORB_ROOT/fc-orb" pause-all
-TimeoutStopSec=900
-
-[Install]
-WantedBy=multi-user.target
-EOF
-		sudo systemctl daemon-reload
-		sudo systemctl enable --now --quiet "$SHUTDOWN_SERVICE"
-		echo "Installed and started $unit"
+		orbctl "$command" "$@"
 		;;
 	destroy)
-		docker rm --force "$FC_ORB_CONTAINER" >/dev/null 2>&1 || true
-		docker volume rm "$FC_ORB_VOLUME" >/dev/null 2>&1 || true
-		echo "Removed the runtime container and the $FC_ORB_VOLUME volume."
+		orbctl delete-all
+		sudo systemctl disable --now --quiet fc-orbd.service || true
+		sudo rm -f /etc/systemd/system/fc-orbd.service /etc/sudoers.d/fc-orb
+		sudo rm -rf "$INSTALL" /var/lib/fc-orbs
+		sudo systemctl daemon-reload
+		echo "Removed all orbs, /var/lib/fc-orbs, and $INSTALL."
 		;;
 	*)
 		usage

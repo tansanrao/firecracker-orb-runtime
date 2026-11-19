@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """orbctl runs Amp orbs as Firecracker microVMs.
 
-It runs as root inside the fc-orb-runtime container, which holds /dev/kvm, the
-tap devices, and the NAT rules. dispatch.sh calls it once per Amp job:
+It runs as root on the host; dispatch.sh calls it through sudo once per Amp
+job:
 
   spawn   boot the orb, or restore it from its memory snapshot, then start
           `amp orb bootstrap` in the guest
@@ -10,11 +10,16 @@ tap devices, and the NAT rules. dispatch.sh calls it once per Amp job:
           sleeping orb uses no CPU or RAM
   delete  remove the orb and its disk
 
-State lives under $FC_ORB_STATE (a Docker volume):
+Each orb's Firecracker runs under the jailer, in a transient systemd unit
+(fc-orb-<id>.service) that caps its CPU and memory, as its own user, in a
+chroot, and in a network namespace of its own.
 
-  images/<image id>/      base root disk built from an orb image
-  snapshots/<key>/        project snapshots: a prepared orb's root disk
-  orbs/<orb id>/          one orb: root disk, config, sockets, logs, snap/
+State lives under /var/lib/fc-orbs:
+
+  images/<image id>/                 base root disk built from an orb image
+  snapshots/<key>/                   project snapshots: a prepared orb's root disk
+  orbs/<orb id>/                     an orb's config and serial console log
+  jail/firecracker/<jail id>/root/   the orb's chroot: its disk, snap/, sockets, fc.log
 """
 
 import argparse
@@ -35,14 +40,25 @@ import sys
 import time
 from pathlib import Path
 
-STATE = Path(os.environ.get("FC_ORB_STATE", "/var/lib/fc-orbs"))
-KERNEL = "/opt/fc/vmlinux"
-GUEST_FILES = Path("/opt/fc/guest")
+STATE = Path("/var/lib/fc-orbs")
+JAIL_BASE = STATE / "jail"
+INSTALL = Path("/opt/fc-orb")
+KERNEL = INSTALL / "vmlinux"
+FIRECRACKER = INSTALL / "bin/firecracker"
+JAILER = INSTALL / "bin/jailer"
+GUEST_FILES = INSTALL / "guest"
 AGENT_PORT = 5252  # must match AGENT_PORT in guest/orb-agent.c
 
 # Each orb gets a /30 from this range: the tap end is the guest's gateway.
 ORB_NETWORK = ipaddress.ip_network("10.213.0.0/16")
+# And a /30 from this one for the veth pair between its namespace and the host.
+LINK_NETWORK = ipaddress.ip_network("10.214.0.0/16")
 FALLBACK_DNS = ["1.1.1.1", "8.8.8.8"]
+# Orb n's Firecracker runs as this UID and GID plus n, clear of the ranges
+# that /etc/subuid and LXD hand out.
+FIRST_ORB_UID = 300000
+# Firecracker's own memory on top of the guest's: page tables, queues, buffers.
+VMM_OVERHEAD_MIB = 256
 
 # ORB_TYPE name -> (vCPUs, memory MiB). An unknown or unset type uses
 # FC_ORB_VCPUS and FC_ORB_MEM_MIB.
@@ -53,6 +69,7 @@ ORB_TYPES = {
     "xlarge": (16, 32768),
 }
 
+DEFAULT_IMAGE = "us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest"
 ORB_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 EXIT_TRAILER = re.compile(rb"\n\x1eORB-EXIT (\d+)\n\Z")
 
@@ -154,10 +171,17 @@ class Orb:
             raise OrbError(f"unsupported orb ID: {orb_id!r}")
         self.id = orb_id
         self.dir = STATE / "orbs" / orb_id
-        self.rootfs = self.dir / "rootfs.ext4"
-        self.api_socket = self.dir / "fc.sock"
-        self.vsock = self.dir / "v.sock"
-        self.snap = self.dir / "snap"
+        # The jailer takes only letters, digits, and hyphens.
+        self.jail_id = re.sub(r"[^A-Za-z0-9-]", "-", orb_id)
+        self.unit = f"fc-orb-{self.jail_id}.service"
+        # The chroot Firecracker runs in. Paths it is given are relative to
+        # this, such as /rootfs.ext4, and must stay the same across restores
+        # because a memory snapshot records them.
+        self.root = JAIL_BASE / "firecracker" / self.jail_id / "root"
+        self.rootfs = self.root / "rootfs.ext4"
+        self.api_socket = self.root / "fc.sock"
+        self.vsock = self.root / "v.sock"
+        self.snap = self.root / "snap"
 
     # A snapshot may be restored only while this marker exists. The marker is
     # removed before the restored VM runs, because from then on the disk moves
@@ -175,8 +199,29 @@ class Orb:
         return self.config["slot"]
 
     @property
+    def uid(self):
+        return FIRST_ORB_UID + self.slot
+
+    @property
     def tap(self):
         return f"orbtap{self.slot}"
+
+    @property
+    def netns(self):
+        return f"orb{self.slot}"
+
+    @property
+    def veth(self):
+        """The host end of the veth pair into the orb's namespace."""
+        return f"vorb{self.slot}"
+
+    @property
+    def link_host_ip(self):
+        return LINK_NETWORK.network_address + 4 * self.slot + 1
+
+    @property
+    def link_netns_ip(self):
+        return LINK_NETWORK.network_address + 4 * self.slot + 2
 
     @property
     def host_ip(self):
@@ -197,11 +242,11 @@ class Orb:
     def pid(self):
         """The orb's Firecracker PID, or None when no Firecracker runs for it."""
         try:
-            pid = int((self.dir / "fc.pid").read_text())
+            pid = int((self.root / "firecracker.pid").read_text())
             arguments = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         except (OSError, ValueError):
             return None
-        is_ours = b"firecracker" in arguments[0] and str(self.api_socket).encode() in arguments
+        is_ours = arguments[0] == b"/firecracker" and arguments[1:3] == [b"--id", self.jail_id.encode()]
         return pid if is_ours else None
 
     def api(self, method, path, body=None, timeout=30):
@@ -255,111 +300,190 @@ class Orb:
                 return
             except OSError as error:
                 if self.pid() is None:
-                    raise OrbError(f"Firecracker exited during boot; see {self.dir}/fc.log") from error
+                    raise OrbError(f"Firecracker exited during boot; see {self.root}/fc.log") from error
                 if time.monotonic() > deadline:
                     raise OrbError(f"guest agent did not answer within {timeout}s; see {self.dir}/console.log") from error
                 time.sleep(0.02)
 
 
-def orb_cpus():
-    """The host CPUs orbs may run on: FC_ORB_CPUSET, else the performance cores.
+def default_cpuset():
+    """The host's performance cores, or None when it has one kind of core.
 
     Hybrid Intel CPUs list their performance cores in cpu_core. Keeping vCPUs
     off the efficiency cores is what gives an orb the host's best
     single-thread speed.
     """
-    spec = os.environ.get("FC_ORB_CPUSET", "")
-    if not spec:
-        try:
-            spec = Path("/sys/devices/cpu_core/cpus").read_text().strip()
-        except OSError:
-            return None
-    cpus = set()
-    for part in spec.split(","):
-        first, _, last = part.partition("-")
-        cpus.update(range(int(first), int(last or first) + 1))
-    return cpus & os.sched_getaffinity(0) or None
+    try:
+        return Path("/sys/devices/cpu_core/cpus").read_text().strip()
+    except OSError:
+        return None
+
+
+def give_to_orb(orb, *paths):
+    """Hands files in the chroot to the orb's user, which Firecracker runs as."""
+    for path in paths:
+        os.chown(path, orb.uid, orb.uid)
+
+
+def link_kernel(orb):
+    """Puts the guest kernel in the chroot, as a hard link when it can."""
+    target = orb.root / "vmlinux"
+    target.unlink(missing_ok=True)
+    try:
+        os.link(KERNEL, target)
+    except OSError:
+        shutil.copyfile(KERNEL, target)
+
+
+def unit_active(orb):
+    result = subprocess.run(["systemctl", "is-active", "--quiet", orb.unit])
+    return result.returncode == 0
 
 
 def start_firecracker(orb):
-    for stale in (orb.api_socket, orb.vsock):
+    """Starts the orb's Firecracker under the jailer in a systemd unit.
+
+    The unit caps the orb at the vCPUs and memory it asked for, lets its
+    memory go to swap, and makes the OOM killer pick orbs before the
+    provider and the desktop (whose processes run at 200). The jailer runs
+    Firecracker as the orb's own user, in its chroot and network namespace,
+    as PID 1 of a new PID namespace. PID 1 ignores SIGTERM, so the unit stops
+    it with SIGKILL; a pause has saved what it needs by then.
+    """
+    config = orb.config
+    orb.root.mkdir(parents=True, exist_ok=True)
+    # The jailer makes these on every start and refuses to run if they exist.
+    for made in ("dev", "run"):
+        shutil.rmtree(orb.root / made, ignore_errors=True)
+    for stale in (orb.api_socket, orb.vsock, orb.root / "firecracker.pid", orb.root / "firecracker"):
         stale.unlink(missing_ok=True)
-    cpus = orb_cpus()
-
-    def pin_to_cpus():
-        if cpus:
-            os.sched_setaffinity(0, cpus)
-        # User processes, such as the provider, run at 200, so without this
-        # the OOM killer takes them before an orb many times their size. An
-        # orb it kills boots from its disk, as after a power loss.
-        Path("/proc/self/oom_score_adj").write_text("500")
-
-    firecracker_id = re.sub(r"[^A-Za-z0-9-]", "-", orb.id)
-    log_path = orb.dir / "fc.log"
-    with open(orb.dir / "console.log", "ab") as console, open(log_path, "ab") as fc_log:
-        process = subprocess.Popen(
-            [
-                "firecracker",
-                "--api-sock", str(orb.api_socket),
-                "--id", firecracker_id,
-                "--log-path", str(log_path),  # otherwise logs mix into the console
-                "--level", "Info",
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=console,  # the guest's serial console
-            stderr=fc_log,
-            start_new_session=True,  # outlives this orbctl call
-            preexec_fn=pin_to_cpus,
-        )
-    (orb.dir / "fc.pid").write_text(str(process.pid))
+    link_kernel(orb)
+    (orb.root / "fc.log").touch()
+    give_to_orb(orb, orb.root / "fc.log")
+    # A unit that failed earlier would block starting one of the same name.
+    subprocess.run(["systemctl", "reset-failed", orb.unit], capture_output=True)
+    properties = {
+        "Type": "forking",
+        "PIDFile": orb.root / "firecracker.pid",
+        "KillSignal": "SIGKILL",
+        "Slice": "fc-orbs.slice",
+        # Stopped after fc-orbd at shutdown, which pauses the orb first.
+        "Before": "fc-orbd.service",
+        "CPUQuota": f"{config['vcpus'] * 100}%",
+        "CPUWeight": config["vcpus"] * 25,
+        "MemoryMax": f"{config['memory_mib'] + VMM_OVERHEAD_MIB}M",
+        "MemorySwapMax": "infinity",
+        "OOMScoreAdjust": 500,
+        "StandardOutput": f"append:{orb.dir / 'console.log'}",  # the guest's serial console
+        "StandardError": f"append:{orb.dir / 'console.log'}",
+    }
+    cpus = os.environ.get("FC_ORB_CPUSET") or default_cpuset()
+    if cpus:
+        properties["AllowedCPUs"] = cpus
+    run(
+        "systemd-run", "--quiet", "--collect", "--unit", orb.unit,
+        *(f"--property={name}={value}" for name, value in properties.items()),
+        str(JAILER),
+        "--id", orb.jail_id,
+        "--exec-file", str(FIRECRACKER),
+        "--uid", str(orb.uid), "--gid", str(orb.uid),
+        "--chroot-base-dir", str(JAIL_BASE),
+        "--netns", f"/run/netns/{orb.netns}",
+        "--cgroup-version", "2",  # with no --cgroup, the unit's cgroup is used
+        "--new-pid-ns",
+        "--",
+        "--api-sock", "/fc.sock",
+        "--log-path", "/fc.log",  # otherwise its log mixes into the console
+        "--level", "Info",
+    )
     deadline = time.monotonic() + 10
     while True:
         try:
             orb.api("GET", "/")
             return
         except OSError as error:
-            if process.poll() is not None or time.monotonic() > deadline:
-                raise OrbError(f"Firecracker did not start; see {orb.dir}/fc.log") from error
+            if time.monotonic() > deadline or (orb.pid() is None and not unit_active(orb)):
+                raise OrbError(
+                    f"Firecracker did not start; see `journalctl -u {orb.unit}` and {orb.root}/fc.log"
+                ) from error
             time.sleep(0.005)
 
 
 def stop_firecracker(orb):
-    pid = orb.pid()
-    if pid is None:
+    if orb.pid() is None and not unit_active(orb):
         return
-    os.kill(pid, signal.SIGKILL)
+    subprocess.run(["systemctl", "kill", "--signal=SIGKILL", orb.unit], capture_output=True)
     deadline = time.monotonic() + 10
-    while orb.pid() is not None:
+    while orb.pid() is not None or unit_active(orb):
         if time.monotonic() > deadline:
-            raise OrbError(f"Firecracker (pid {pid}) did not exit")
-        time.sleep(0.005)
+            raise OrbError(f"{orb.unit} did not stop")
+        time.sleep(0.01)
+
+
+# Replaced whole on every spawn, so a newer runtime's rules take effect.
+FIREWALL = f"""
+table inet fc_orbs
+delete table inet fc_orbs
+table inet fc_orbs {{
+    chain forward {{
+        type filter hook forward priority filter; policy accept;
+        # One orb cannot reach another.
+        iifname "vorb*" oifname "vorb*" drop
+    }}
+    chain input {{
+        type filter hook input priority filter; policy accept;
+        # Nor the host itself, except for replies to what the host sent.
+        iifname "vorb*" ct state established,related accept
+        iifname "vorb*" drop
+    }}
+    chain postrouting {{
+        type nat hook postrouting priority srcnat; policy accept;
+        # Orbs reach the outside through the host's own address.
+        ip saddr {ORB_NETWORK} oifname != "vorb*" masquerade
+    }}
+}}
+"""
 
 
 def ensure_network(orb):
-    if not Path(f"/sys/class/net/{orb.tap}").exists():
-        run("ip", "tuntap", "add", "dev", orb.tap, "mode", "tap")
+    """Gives the orb a network namespace with its tap device, routed to the host.
+
+    The guest's gateway is the tap, inside the namespace. A veth pair joins
+    the namespace to the host, which routes the orb's /30 to it and NATs the
+    orb's traffic out.
+    """
+    netns = ("ip", "-n", orb.netns)
+    if not Path(f"/run/netns/{orb.netns}").exists():
+        run("ip", "netns", "add", orb.netns)
+    run("ip", "netns", "exec", orb.netns, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+    run(*netns, "link", "set", "lo", "up")
+    if not Path(f"/sys/class/net/{orb.veth}").exists():
+        run("ip", "link", "add", orb.veth, "type", "veth", "peer", "name", "veth0", "netns", orb.netns)
+    run("ip", "addr", "replace", f"{orb.link_host_ip}/30", "dev", orb.veth)
+    run("ip", "link", "set", orb.veth, "up")
+    run(*netns, "addr", "replace", f"{orb.link_netns_ip}/30", "dev", "veth0")
+    run(*netns, "link", "set", "veth0", "up")
+    run(*netns, "route", "replace", "default", "via", str(orb.link_host_ip))
+    if subprocess.run([*netns, "link", "show", orb.tap], capture_output=True).returncode != 0:
+        # Owned by the orb's user, so Firecracker can attach to it unprivileged.
+        run(*netns, "tuntap", "add", "dev", orb.tap, "mode", "tap", "user", str(orb.uid), "group", str(orb.uid))
         # A restored guest still has its gateway's MAC address cached, so a
         # recreated tap must come back with the same one or the guest's
         # packets are dropped until that cache entry expires.
-        run("ip", "link", "set", "dev", orb.tap, "address", orb.host_mac)
-    run("ip", "addr", "replace", f"{orb.host_ip}/30", "dev", orb.tap)
-    run("ip", "link", "set", orb.tap, "up")
-    rules = [
-        # Orbs reach the outside through the container's own address.
-        ("nat", "POSTROUTING", "-s", str(ORB_NETWORK), "!", "-o", "orbtap+", "-j", "MASQUERADE"),
-        # One orb cannot reach another.
-        ("filter", "FORWARD", "-i", "orbtap+", "-o", "orbtap+", "-j", "DROP"),
-    ]
+        run(*netns, "link", "set", "dev", orb.tap, "address", orb.host_mac)
+    run(*netns, "addr", "replace", f"{orb.host_ip}/30", "dev", orb.tap)
+    run(*netns, "link", "set", orb.tap, "up")
+    run("ip", "route", "replace", f"{orb.host_ip - 1}/30", "via", str(orb.link_netns_ip), "dev", orb.veth)
     with locked("network"):
-        for table, chain, *rule in rules:
-            exists = subprocess.run(["iptables", "-w", "-t", table, "-C", chain, *rule], capture_output=True)
-            if exists.returncode != 0:
-                run("iptables", "-w", "-t", table, "-A", chain, *rule)
+        result = subprocess.run(["nft", "-f", "-"], input=FIREWALL, text=True, capture_output=True)
+        if result.returncode != 0:
+            raise OrbError(f"nft: {result.stderr.strip()}")
 
 
 def remove_network(orb):
-    if Path(f"/sys/class/net/{orb.tap}").exists():
-        run("ip", "link", "del", orb.tap)
+    """Deletes the namespace, which takes the tap, the veth pair, and the route."""
+    if Path(f"/run/netns/{orb.netns}").exists():
+        run("ip", "netns", "del", orb.netns)
 
 
 def allocate_slot():
@@ -374,15 +498,14 @@ def allocate_slot():
 def create(orb):
     """Gives a new orb its disk: a project snapshot if we have it, else the image."""
     snapshot_id = os.environ.get("ORB_SNAPSHOT_ID", "")
-    image_id = os.environ.get("ORB_IMAGE_ID", "")
     if snapshot_id and (snapshot_dir(snapshot_id) / "rootfs.ext4").exists():
         source = snapshot_dir(snapshot_id)
         log(f"creating {orb.id} from project snapshot {snapshot_id}")
-    elif image_id and (image_dir(image_id) / "rootfs.ext4").exists():
-        source = image_dir(image_id)
-        log(f"creating {orb.id} from image {image_id[:19]}")
     else:
-        raise OrbError("no base disk for this orb: import the orb image first (dispatch.sh does this)")
+        image = os.environ.get("ORB_IMAGE") or DEFAULT_IMAGE
+        image_id = ensure_image(image)
+        source = image_dir(image_id)
+        log(f"creating {orb.id} from image {image_id[:12]}")
 
     vcpus, memory_mib = ORB_TYPES.get(
         os.environ.get("ORB_TYPE", ""),
@@ -397,12 +520,19 @@ def create(orb):
             "slot": allocate_slot(),
         }
         (orb.dir / "config.json").write_text(json.dumps(config, indent=2))
+    orb.root.mkdir(parents=True, exist_ok=True)
     clone_file(source / "rootfs.ext4", orb.rootfs)
+    give_to_orb(orb, orb.rootfs)
+
+
+def in_jail(orb, path):
+    """A path in the orb's chroot as its Firecracker sees it."""
+    return "/" + str(path.relative_to(orb.root))
 
 
 def cold_boot(orb):
     config = orb.config
-    for stale in (orb.snap, orb.dir / "snap.new"):
+    for stale in (orb.snap, orb.root / "snap.new"):
         shutil.rmtree(stale, ignore_errors=True)
     ensure_network(orb)
     start_firecracker(orb)
@@ -413,13 +543,13 @@ def cold_boot(orb):
         f"ip={orb.guest_ip}::{orb.host_ip}:255.255.255.252:{orb.id}:eth0:off"
     )
     orb.api("PUT", "/machine-config", {"vcpu_count": config["vcpus"], "mem_size_mib": config["memory_mib"]})
-    orb.api("PUT", "/boot-source", {"kernel_image_path": KERNEL, "boot_args": boot_args})
+    orb.api("PUT", "/boot-source", {"kernel_image_path": "/vmlinux", "boot_args": boot_args})
     orb.api(
         "PUT",
         "/drives/rootfs",
         {
             "drive_id": "rootfs",
-            "path_on_host": str(orb.rootfs),
+            "path_on_host": in_jail(orb, orb.rootfs),
             "is_root_device": True,
             "is_read_only": False,
             # Honor the guest's flushes, so its filesystem survives a host crash.
@@ -431,7 +561,7 @@ def cold_boot(orb):
         "/network-interfaces/eth0",
         {"iface_id": "eth0", "host_dev_name": orb.tap, "guest_mac": orb.guest_mac},
     )
-    orb.api("PUT", "/vsock", {"guest_cid": 3, "uds_path": str(orb.vsock)})
+    orb.api("PUT", "/vsock", {"guest_cid": 3, "uds_path": in_jail(orb, orb.vsock)})
     orb.api("PUT", "/entropy", {})
     # The guest reports memory it frees, and Firecracker hands it back to the
     # host. Without this, an orb keeps every page it ever touched until it
@@ -458,8 +588,8 @@ def restore(orb):
             "PUT",
             "/snapshot/load",
             {
-                "snapshot_path": str(orb.snap / "vmstate"),
-                "mem_backend": {"backend_type": "File", "backend_path": str(orb.snap / "mem")},
+                "snapshot_path": in_jail(orb, orb.snap / "vmstate"),
+                "mem_backend": {"backend_type": "File", "backend_path": in_jail(orb, orb.snap / "mem")},
                 "resume_vm": True,
             },
             timeout=60,
@@ -477,13 +607,17 @@ def restore(orb):
 def prepare_guest(orb):
     """Sets what a restored guest cannot know: the time and the host's DNS."""
     nameservers = []
-    for line in Path("/etc/resolv.conf").read_text().splitlines():
+    # With systemd-resolved, /etc/resolv.conf names its stub on loopback, and
+    # this file lists the upstream servers behind it.
+    upstream = Path("/run/systemd/resolve/resolv.conf")
+    for line in (upstream if upstream.exists() else Path("/etc/resolv.conf")).read_text().splitlines():
         fields = line.split()
         if len(fields) < 2 or fields[0] != "nameserver":
             continue
         with contextlib.suppress(ValueError):
-            # The guest cannot reach a resolver on the container's loopback.
-            if not ipaddress.ip_address(fields[1]).is_loopback:
+            address = ipaddress.ip_address(fields[1])
+            # The guest has no IPv6 and cannot reach the host's loopback.
+            if address.version == 4 and not address.is_loopback:
                 nameservers.append(fields[1])
     resolv_conf = "".join(f"nameserver {server}\n" for server in nameservers or FALLBACK_DNS)
     hosts = f"127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n127.0.1.1 {orb.id}\n"
@@ -640,9 +774,10 @@ def pause(orb):
         # or a boot after a failed restore) holds everything written so far.
         with contextlib.suppress(OSError, OrbError):
             orb.run_in_guest("sync", timeout=60)
-        staging = orb.dir / "snap.new"
+        staging = orb.root / "snap.new"
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir()
+        give_to_orb(orb, staging)  # Firecracker writes the snapshot as the orb's user
         try:
             orb.api("PATCH", "/vm", {"state": "Paused"})
             # The running guest still reads its previous memory file, so the
@@ -653,8 +788,8 @@ def pause(orb):
                 "/snapshot/create",
                 {
                     "snapshot_type": "Full",
-                    "snapshot_path": str(staging / "vmstate"),
-                    "mem_file_path": str(staging / "mem"),
+                    "snapshot_path": in_jail(orb, staging / "vmstate"),
+                    "mem_file_path": in_jail(orb, staging / "mem"),
                     # Synced below, after the unused pages are dropped.
                     "sync_snapshot_files": False,
                 },
@@ -670,7 +805,7 @@ def pause(orb):
         shutil.rmtree(orb.snap, ignore_errors=True)
         if saved:
             staging.rename(orb.snap)
-            fsync(orb.dir)
+            fsync(orb.root)
             size_mib = (orb.snap / "mem").stat().st_blocks * 512 // 2**20
             log(f"{orb.id} paused in {time.monotonic() - started:.2f}s ({size_mib} MiB of memory saved)")
         else:
@@ -685,6 +820,7 @@ def delete(orb):
     stop_firecracker(orb)
     if (orb.dir / "config.json").exists():
         remove_network(orb)
+    shutil.rmtree(orb.root.parent, ignore_errors=True)
     shutil.rmtree(orb.dir, ignore_errors=True)
     log(f"{orb.id} deleted")
 
@@ -707,30 +843,44 @@ def command_job(arguments):
         {"spawn": spawn, "pause": pause, "delete": delete}[arguments.command](orb)
 
 
-def command_needs_image(arguments):
-    """Prints yes when spawning $ORB_ID needs the base disk of an orb image."""
-    orb = Orb(os.environ["ORB_ID"])
-    snapshot_id = os.environ.get("ORB_SNAPSHOT_ID", "")
-    has_disk = orb.rootfs.exists() or (snapshot_id and (snapshot_dir(snapshot_id) / "rootfs.ext4").exists())
-    print("no" if has_disk else "yes")
+def ensure_image(image):
+    """Returns the ID of an orb image's base disk, building the disk on first use.
+
+    Pulls the image with Podman only when the host does not have it, so an
+    image is never updated behind existing orbs; `podman pull` updates it.
+    """
+    with locked("images"):
+        if subprocess.run(["podman", "image", "exists", image]).returncode != 0:
+            log(f"pulling {image}")
+            run("podman", "pull", "--quiet", image)
+        image_id = run("podman", "image", "inspect", "--format", "{{.Id}}", image).strip()
+        if not (image_dir(image_id) / "rootfs.ext4").exists():
+            log(f"building a root disk from {image} (once per image, about a minute)")
+            image_config = run("podman", "image", "inspect", "--format", "{{json .Config}}", image)
+            container = run("podman", "create", image).strip()
+            try:
+                export = subprocess.Popen(["podman", "export", container], stdout=subprocess.PIPE)
+                import_image(image_id, image_config, export.stdout)
+                if export.wait() != 0:
+                    raise OrbError(f"podman export of {image} failed")
+            finally:
+                subprocess.run(["podman", "rm", "--force", container], capture_output=True)
+        return image_id
 
 
-def command_has_image(arguments):
-    print("yes" if (image_dir(arguments.image_id) / "rootfs.ext4").exists() else "no")
-
-
-def command_import_image(arguments):
-    """Builds a base root disk from `docker export` output on stdin."""
-    target = image_dir(arguments.image_id)
+def import_image(image_id, image_config, stream):
+    """Builds a base root disk from the files of an exported container."""
+    target = image_dir(image_id)
     if (target / "rootfs.ext4").exists():
         return
     staging = target.with_name(target.name + ".tmp")
     shutil.rmtree(staging, ignore_errors=True)
     root = staging / "root"
     root.mkdir(parents=True)
-    subprocess.run(["tar", "-x", "-p", "--numeric-owner", "-C", str(root)], stdin=sys.stdin.buffer, check=True)
+    subprocess.run(["tar", "-x", "-p", "--numeric-owner", "-C", str(root)], stdin=stream, check=True)
 
-    (root / ".dockerenv").unlink(missing_ok=True)
+    for marker in (".dockerenv", "run/.containerenv"):
+        (root / marker).unlink(missing_ok=True)
     guest_files = [("orb-init", "sbin/orb-init", 0o755), ("orb-agent", "usr/local/sbin/orb-agent", 0o755)]
     # `sbin` and `lib` are symlinks into `usr` in current images, so test the
     # path a symlink in the image cannot redirect outside it.
@@ -754,12 +904,19 @@ def command_import_image(arguments):
         handle.truncate(disk_gib() * 2**30)
     run("mkfs.ext4", "-q", "-F", "-L", "orbroot", "-m", "0", "-d", str(root), str(disk))
     shutil.rmtree(root)
-    (staging / "image.json").write_text(arguments.image_config)
+    (staging / "image.json").write_text(image_config)
     fsync(disk, staging / "image.json", staging)
     shutil.rmtree(target, ignore_errors=True)
     staging.rename(target)
     fsync(target.parent)
-    log(f"imported image {arguments.image_id[:19]} as a {disk_gib()} GiB root disk")
+    log(f"imported image {image_id[:12]} as a {disk_gib()} GiB root disk")
+
+
+def command_console(arguments):
+    orb = Orb(arguments.orb_id)
+    for path in (orb.dir / "console.log", orb.root / "fc.log"):
+        with contextlib.suppress(FileNotFoundError):
+            sys.stdout.write(path.read_text(errors="replace"))
 
 
 def command_list(arguments):
@@ -801,17 +958,27 @@ def command_pause_all(arguments):
     pause_all()
 
 
+def command_delete_all(arguments):
+    for orb in all_orbs():
+        with locked(orb.id):
+            delete(orb)
+
+
 def command_serve(arguments):
-    """The container's main process: on `docker stop`, snapshots running orbs."""
+    """fc-orbd's main process: when the service stops, snapshots running orbs.
+
+    Orb units are ordered before fc-orbd.service, so at shutdown systemd
+    stops this first, and every orb is paused before its unit is killed.
+    """
 
     def stop(signal_number, frame):
-        log("runtime stopping; pausing running orbs")
+        log("fc-orbd stopping; pausing running orbs")
         pause_all()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    for directory in ("orbs", "images", "snapshots"):
+    for directory in ("orbs", "images", "snapshots", "jail"):
         (STATE / directory).mkdir(parents=True, exist_ok=True)
     log("runtime ready")
     while True:
@@ -823,14 +990,9 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("spawn", "pause", "delete"):
         commands.add_parser(name, help=f"run the Amp {name} job for $ORB_ID").set_defaults(run=command_job)
-    commands.add_parser("needs-image").set_defaults(run=command_needs_image)
-    has_image = commands.add_parser("has-image")
-    has_image.add_argument("image_id")
-    has_image.set_defaults(run=command_has_image)
-    import_image = commands.add_parser("import-image", help="build a base disk from `docker export` on stdin")
-    import_image.add_argument("image_id")
-    import_image.add_argument("image_config", help="the image's Config as JSON (User, Env, WorkingDir)")
-    import_image.set_defaults(run=command_import_image)
+    prepare = commands.add_parser("prepare-image", help="pull an orb image and build its base disk")
+    prepare.add_argument("image", nargs="?", default=DEFAULT_IMAGE)
+    prepare.set_defaults(run=lambda arguments: ensure_image(arguments.image))
     commands.add_parser("list", help="list orbs and their state").set_defaults(run=command_list)
     exec_parser = commands.add_parser("exec", help="run a bash script in a running orb")
     exec_parser.add_argument("--user", help="run as this user instead of root")
@@ -838,8 +1000,12 @@ def main():
     exec_parser.add_argument("orb_id")
     exec_parser.add_argument("script")
     exec_parser.set_defaults(run=command_exec)
+    console = commands.add_parser("console", help="print an orb's serial console and Firecracker log")
+    console.add_argument("orb_id")
+    console.set_defaults(run=command_console)
     commands.add_parser("pause-all", help="pause every running orb").set_defaults(run=command_pause_all)
-    commands.add_parser("serve", help="container main process").set_defaults(run=command_serve)
+    commands.add_parser("delete-all", help="delete every orb and its disk").set_defaults(run=command_delete_all)
+    commands.add_parser("serve", help="fc-orbd's main process").set_defaults(run=command_serve)
 
     arguments = parser.parse_args()
     try:

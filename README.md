@@ -11,7 +11,7 @@ Measured on an i9-13900 with 4 vCPU, 8 GiB orbs:
 | | |
 | --- | --- |
 | New orb, from job to bootstrap started | 1.1 to 1.5 s |
-| Wake from sleep | 0.4 s idle, 1.3 s with 7.7 GiB of memory in use |
+| Wake from sleep | 0.5 s idle, 1.3 s with 7.7 GiB of memory in use |
 | Pause | about 5 s |
 | Single-thread speed | same as a container on the host (Python `fib(32)`: 0.132 s in both) |
 
@@ -21,19 +21,23 @@ It is built for one trusted user on one host. See [Known limits](#known-limits) 
 ## Requirements
 
 - Linux x86-64 with KVM (`/dev/kvm`).
-- Docker, and a user who can run it. Nothing else needs root, apart from installing the shutdown hook.
+- systemd, `sudo`, Podman (`apt install podman`), and nftables.
 - The `amp` CLI, signed in.
-- A filesystem with reflinks (btrfs or XFS) under Docker's data directory, so that creating an orb's disk is instant.
+- A filesystem with reflinks (btrfs or XFS) under `/var/lib/fc-orbs`, so that creating an orb's disk is instant.
   Other filesystems work and copy the disk instead.
 - Disk space: each orb takes what it writes to its disk, plus up to its memory size while it sleeps.
 
-Firecracker, the guest kernel, the tap devices, and the NAT rules all live in one container, `fc-orb-runtime`. No
-packages are installed on the host and its network configuration is not changed.
+The runtime runs on the host. `setup` installs Firecracker, its jailer, the guest kernel, and `orbctl` to
+`/opt/fc-orb`, the `fc-orbd` system service, and a sudo rule that lets you, and so the provider, run `orbctl` as root.
+Each orb's Firecracker runs under the jailer: as its own user, in a chroot, in its own PID and network namespaces, and
+in a systemd unit that caps it at the vCPUs and memory it asked for. Orb state lives in `/var/lib/fc-orbs`, and the
+orbs' NAT and isolation rules in the `inet fc_orbs` nftables table.
 
 ## Setup
 
-1. Build the runtime and prepare the orb image's disk. The first run builds the guest kernel and pulls Amp's 6 GB orb
-   image, which takes about five minutes plus the download.
+1. Build and install the runtime, and prepare the orb image's disk. It asks for your password through `sudo`. The
+   first run builds the guest kernel and pulls Amp's 6 GB orb image, which takes about five minutes plus the
+   download.
 
    ```bash
    ./fc-orb setup
@@ -56,14 +60,6 @@ packages are installed on the host and its network configuration is not changed.
    ```bash
    ./fc-orb install-service
    loginctl enable-linger "$USER"      # start it at boot, without a login
-   ```
-
-   Then install the shutdown hook, the one step that uses `sudo`. It is a system unit that pauses running orbs before
-   Docker stops, at shutdown or when Docker restarts or is upgraded. Without it, systemd gives Docker 90 s to stop,
-   and orbs that have not finished pausing by then lose their processes.
-
-   ```bash
-   ./fc-orb install-shutdown-hook
    ```
 
 5. Start a thread on it. In the composer, open **Orb** and choose the provider under **Self-Hosted**, or:
@@ -90,23 +86,23 @@ Run exactly one provider per token. Do not also run `amp orb provider` by hand w
 
 systemctl --user status fc-orb-provider          # the provider
 journalctl --user -u fc-orb-provider -f          # its log: every job, and the runtime's output for it
+systemctl status 'fc-orb-*.service'              # running orbs' Firecracker units, with CPU and memory use
 ```
 
 An orb's ID is `amp-` followed by its thread ID without the `T-`.
 
-`docker stop fc-orb-runtime` snapshots the running orbs first, and they resume from memory on their next message.
-That message waits about 35 s, because Amp did not know the orb was asleep. The shutdown hook does the same at a host
-reboot or a Docker restart, and the container, the hook, and the provider all start again at boot.
+Stopping `fc-orbd` (`sudo systemctl stop fc-orbd`, or a host shutdown) snapshots the running orbs first, and they
+resume from memory on their next message. That message waits about 35 s, because Amp did not know the orb was asleep.
 
 ## Updating
 
 | What | How |
 | --- | --- |
-| This repository's code | `./fc-orb setup`. It rebuilds the runtime and, if the image changed, pauses running orbs and restarts the container. |
-| Guest kernel | Set `KERNEL_COMMIT` in `runtime/Dockerfile` to the commit of the newest `kernel6.18-*` tag (the command is in a comment there), then `./fc-orb setup` and `./scripts/smoke-test.sh`. |
+| This repository's code | `./fc-orb setup`. Running orbs keep running; the next job uses the new `orbctl`. |
+| Guest kernel | Set `KERNEL_COMMIT` in `runtime/Containerfile` to the commit of the newest `kernel6.18-*` tag (the command is in a comment there), then `./fc-orb setup` and `./scripts/smoke-test.sh`. |
 | Kernel options | Add them to `runtime/guest/kernel.config`. The build fails if an option does not take effect. |
-| Firecracker | Set `FIRECRACKER_VERSION`, `FIRECRACKER_SHA256`, and `FIRECRACKER_COMMIT` in `runtime/Dockerfile`. Memory snapshots from another version may not load; those orbs boot from disk and keep their files. |
-| Orb image | `docker pull` the image, then `./fc-orb setup`. The runtime never pulls an image it already has. Existing orbs keep the image they started from. |
+| Firecracker | Set `FIRECRACKER_VERSION`, `FIRECRACKER_SHA256`, and `FIRECRACKER_COMMIT` in `runtime/Containerfile`. Memory snapshots from another version may not load; those orbs boot from disk and keep their files. |
+| Orb image | `sudo podman pull` the image, then `./fc-orb setup`. The runtime never pulls an image it already has. Existing orbs keep the image they started from. |
 
 The guest kernel is Amazon Linux 2023's `kernel6.18` source built with Firecracker's own microVM config, which is the
 pairing Firecracker validates and supports until at least June 2028. A sleeping orb keeps the kernel it booted, because
@@ -115,7 +111,7 @@ its memory snapshot contains the running kernel; it gets a new one the next time
 ## Settings
 
 Set these in the provider's environment: run `systemctl --user edit fc-orb-provider`, add `Environment=` lines under
-`[Service]`, and restart the service.
+`[Service]`, and restart the service. The sudo rule passes only these variables to `orbctl`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -134,15 +130,16 @@ If you add orb types to the provider in Amp's settings, the names `small` (2 vCP
 amp orb provider set-default builtin
 systemctl --user disable --now fc-orb-provider
 rm ~/.config/systemd/user/fc-orb-provider.service
-./fc-orb destroy                                 # deletes the container and ALL orbs, disks, and snapshots
+./fc-orb destroy                                 # deletes ALL orbs, disks, and snapshots, and /opt/fc-orb
 ```
 
 Then delete the provider under **Settings → Orbs**.
 
 ## Known limits
 
-- **One trusted user.** Firecracker runs as root in a container, without its jailer and without per-orb CPU or I/O
-  limits. Do not run untrusted code or other people's threads on it.
+- **One trusted user.** Each orb is jailed and capped, but `orbctl` runs as root for anyone in the sudo rule, there
+  is no AppArmor profile yet, orbs can reach the LAN, and there are no I/O limits. Do not run other people's threads
+  on it.
 - **Running orbs return freed memory, but not their page cache.** After a process in an orb exits, the host gets its
   memory back at about 250 MiB/s, but files the orb has read stay cached on the host until it pauses. Orbs started
   before this was added get it on their next boot from disk. An orb can grow back to its full size at any time, so a
@@ -152,7 +149,7 @@ Then delete the provider under **Settings → Orbs**.
   dropped. One 8 GiB orb takes about 5 s; four at once took about 20 s each.
 - **A portal does not wake a sleeping orb.** Amp answers the request itself and sends no job. Send the thread a
   message to wake it.
-- **Nothing is cleaned up.** Base disks of old images and unused project snapshots stay in the `fc-orbs` volume. An
+- **Nothing is cleaned up.** Base disks of old images and unused project snapshots stay in `/var/lib/fc-orbs`. An
   orb's disk keeps the size it was created with.
 - **Open connections do not survive a long sleep.** Processes resume, but the other end of a TCP connection will have
   hung up.

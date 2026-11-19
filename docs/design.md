@@ -8,16 +8,37 @@ what was measured and tested. Numbers are from one machine: an i9-13900 with 61 
 
 | Part | Role |
 | --- | --- |
-| `dispatch.sh` | The program `amp orb provider` runs once per `spawn`, `pause`, or `delete` job. |
-| `fc-orb` | Operator commands: setup, service and shutdown hook install, list, exec, console. |
-| `lib.sh` | Starts the runtime container and turns an orb image into a root disk. Shared by the two scripts above. |
-| `runtime/Dockerfile` | The `fc-orb-runtime` image: Firecracker, the guest kernel, `orbctl`, and the guest files. |
-| `runtime/orbctl` | Runs as root in the container and drives Firecracker's API. All orb state is its. |
+| `dispatch.sh` | The program `amp orb provider` runs once per `spawn`, `pause`, or `delete` job. It runs `orbctl` through `sudo`. |
+| `fc-orb` | Operator commands: setup (build, install, sudo rule, `fc-orbd`), provider service install, list, exec, console. |
+| `runtime/Containerfile` | Builds Firecracker and its jailer (pinned release), the guest kernel, and `orb-agent`. Nothing runs in it; `setup` copies the files to `/opt/fc-orb`. |
+| `runtime/orbctl` | Runs as root on the host, starts each orb's jailer, and drives Firecracker's API. All orb state is its. As `orbctl serve` it is `fc-orbd`. |
 | `runtime/guest/` | What goes into every orb's disk (`orb-init`, `orb-agent`, its systemd unit) and `kernel.config`. |
 | `scripts/smoke-test.sh` | Runs every job against a stand-in for `amp orb bootstrap` and checks what must survive. |
 
-The host side needs only Docker. The container runs with `--device /dev/kvm`, `--device /dev/net/tun`, and
-`NET_ADMIN`, so tap devices and NAT rules live in its network namespace.
+`fc-orb setup` installs the sudo rule `/etc/sudoers.d/fc-orb`, which lets the operator, and so the provider, run
+`/opt/fc-orb/bin/orbctl` as root and passes only the job's variables and the `FC_ORB_*` settings through. The orb
+token reaches `orbctl` in its environment, never in a command line. `orbctl` is root-owned in `/opt/fc-orb`, so the
+rule cannot be used to run a file the operator can edit.
+
+## The jail
+
+Each orb's Firecracker runs under Firecracker's jailer, in a transient systemd unit `fc-orb-<orb id>.service` in
+`fc-orbs.slice`:
+
+- **User:** UID and GID 300000 plus the orb's network slot, clear of `/etc/subuid` and LXD's ranges.
+- **Chroot:** `/var/lib/fc-orbs/jail/firecracker/<orb id>/root`, holding the orb's disk, memory snapshot, sockets,
+  log, and a hard link to the kernel. Firecracker sees them as `/rootfs.ext4`, `/snap/mem`, and so on, which is also
+  what a memory snapshot records, so restores find them again. The jailer makes `/dev` with only `kvm`, `net/tun`,
+  `urandom`, and `userfaultfd`, and refuses to start if it already exists, so `orbctl` removes it first.
+- **Namespaces:** a new mount namespace, a new PID namespace in which Firecracker is PID 1, and the orb's network
+  namespace.
+- **Seccomp:** Firecracker's default filters, which are built in.
+- **Caps:** `CPUQuota` of the orb's vCPUs × 100%, `CPUWeight` proportional to them, `MemoryMax` of guest memory plus
+  256 MiB, `MemorySwapMax=infinity`, and `OOMScoreAdjust=500`. `AllowedCPUs` keeps vCPUs on the performance cores.
+- **Stop:** PID 1 ignores SIGTERM, so the unit is stopped with SIGKILL. A pause has saved the orb by then.
+
+Orb units are ordered before `fc-orbd.service`, so at shutdown systemd stops `fc-orbd` first. `fc-orbd` pauses every
+running orb as it stops, and only then are the orb units killed.
 
 ## What each job does
 
@@ -37,29 +58,30 @@ The host side needs only Docker. The container runs with `--device /dev/kvm`, `-
 2. Pause the VM and write a full snapshot next to the previous one.
 3. Kill Firecracker, punch the zero pages out of the memory file, fsync the snapshot and the disk, mark the snapshot
    valid, and swap it in.
-4. Remove the tap device.
+4. Remove the orb's network namespace.
 5. If the job names `ORB_SNAPSHOT_ID`, copy the orb's disk under that ID.
 
-**delete** kills Firecracker and removes the orb's directory.
+**delete** kills Firecracker and removes the orb's directory and its jail.
 
 Every job takes a per-orb lock and is safe to repeat.
 
 ## State
 
-Everything is in the `fc-orbs` Docker volume, mounted at `/var/lib/fc-orbs`:
+Everything is in `/var/lib/fc-orbs`:
 
 ```
 images/<image id>-<guest files hash>-<size>g/   base disk built from an orb image
 snapshots/<key>/                                project snapshots
 orbs/<orb id>/
-    rootfs.ext4      the orb's disk
     config.json      image config, vCPUs, memory, network slot
-    snap/            memory snapshot: mem, vmstate, and a `valid` marker
     console.log      guest serial console
+jail/firecracker/<orb id>/root/                 the orb's chroot, owned by its user
+    rootfs.ext4      the orb's disk
+    snap/            memory snapshot: mem, vmstate, and a `valid` marker
     fc.log           Firecracker's log
 ```
 
-A base disk is the output of `docker export` written into a sparse ext4 file with `mkfs.ext4 -d`, plus the guest files.
+Orb images are pulled with root's Podman. A base disk is the output of `podman export` written into a sparse ext4 file with `mkfs.ext4 -d`, plus the guest files.
 Its directory name includes a hash of those files and the disk size, so a runtime that changes either builds a new
 base disk and leaves existing orbs alone. Disks are copied with `cp --reflink=auto`.
 
@@ -129,17 +151,19 @@ OOM killer would pick them before an orb many times their size. An orb it kills 
 
 ## Network
 
-Each orb gets a /30 from `10.213.0.0/16`: the tap device is the gateway and the guest has the other address. The
-container masquerades orb traffic, so orbs reach the internet and whatever the host's network allows. A forward rule
-drops traffic between orbs.
+Each orb has a network namespace `orb<slot>`. In it, the orb's tap device, owned by the orb's user, is the guest's
+gateway on a /30 from `10.213.0.0/16`. A veth pair (`vorb<slot>` on the host) on a /30 from `10.214.0.0/16` joins the
+namespace to the host, which routes the orb's /30 to it. The `inet fc_orbs` nftables table masquerades orb traffic
+out of the host, drops traffic between orbs, and drops what orbs send to the host itself, so they reach the internet
+and the LAN but none of the host's own addresses. `orbctl` replaces the table on every spawn.
 
-The tap device is deleted on pause and recreated on spawn with the same MAC address, derived from its IP. Without
+The namespace is deleted on pause and recreated on spawn, with the tap's MAC address derived from its IP. Without
 that, a restored guest keeps sending to the old gateway MAC from its neighbor cache and has no network until the entry
 expires.
 
 ## Guest kernel
 
-`runtime/Dockerfile` builds the kernel from a pinned commit of Amazon Linux 2023's `kernel6.18` source, using
+`runtime/Containerfile` builds the kernel from a pinned commit of Amazon Linux 2023's `kernel6.18` source, using
 `microvm-kernel-ci-x86_64-6.18.config` and `ci.config` from the Firecracker release it installs, plus
 `runtime/guest/kernel.config`. Firecracker's
 [kernel policy](https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md) names this source
@@ -184,10 +208,11 @@ frontend. In that orb:
   Chrome, and agent process.
 - Rebuilding the runtime under the running orb snapshotted it; the next message restored it with the same processes.
 
-A host reboot kept four running orbs, each holding a 2 GiB process, with the same boot ID and process. During
-shutdown the hook paused them in 28 s, and only then did systemd stop Docker. After boot, each restored in 0.4 s.
-`systemctl restart docker` did the same in 24 s.
+Under the earlier Docker-based runtime, a host reboot kept four running orbs, each holding a 2 GiB process, with
+the same boot ID and process. The jailed runtime has not been through a reboot yet. Restarting `fc-orbd` paused a
+running orb and the next spawn restored it with the same boot ID and process. Orbs could not reach the host on its
+LAN, Tailscale, or veth addresses. Jailing adds about 0.1 s to a wake (0.5 s instead of 0.4 s).
 
-Stopping the runtime with `docker stop` snapshots running orbs, and killing the provider with `SIGKILL` gets it
+Killing the provider with `SIGKILL` gets it
 restarted by systemd. After the kill, the new provider waited 50 s for Amp to drop the old connection before taking
 jobs.

@@ -4,7 +4,7 @@
 # Needs no Amp account. Takes about a minute.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
-RUNTIME="${FC_ORB_CONTAINER:-fc-orb-runtime}"
+STATE=/var/lib/fc-orbs
 
 A="amp-smoketest-a-$$"
 B="amp-smoketest-b-$$"
@@ -37,7 +37,7 @@ equal() { [[ "$1" == "$2" ]] || { echo "      expected '$2', got '$1'"; return 1
 cleanup() {
 	job delete "$A" >/dev/null 2>&1 || true
 	job delete "$B" >/dev/null 2>&1 || true
-	docker exec "$RUNTIME" sh -c 'rm -rf /var/lib/fc-orbs/snapshots/smoketest_snapshot_*' || true
+	sudo sh -c "rm -rf $STATE/snapshots/smoketest_snapshot_*" || true
 }
 trap cleanup EXIT
 
@@ -48,6 +48,10 @@ check "bootstrap ran as the image's user with the token" \
 	equal "$(guest "$A" 'cat /tmp/bootstrap.log')" "bootstrap user=user token=first"
 check "guest reaches ampcode.com" guest "$A" 'curl -fsS -m 10 -o /dev/null https://ampcode.com/'
 check "user has passwordless sudo" equal "$(guest "$A" 'sudo -n id -u')" 0
+fc_pid="$(pgrep -f -- "--id $A ")"
+check "Firecracker runs jailed as its own user" test "$(ps -o uid= -p "$fc_pid")" -ge 300000
+check "its unit caps it at 4 vCPUs and 8 GiB plus overhead" \
+	equal "$(systemctl show "fc-orb-$A.service" -p CPUQuotaPerSecUSec -p MemoryMax --value | tr '\n' ' ')" "4s 8858370048 "
 
 # A process whose state lives only in memory (tmpfs and its own counter).
 guest "$A" 'nohup python3 -c "
@@ -69,7 +73,7 @@ echo "== pause, then spawn again"
 job pause "$A"
 check "paused orb has a memory snapshot" equal "$(state "$A")" paused
 check "paused orb has no Firecracker process" \
-	equal "$(docker exec "$RUNTIME" pgrep -fc "orbs/$A/fc.sock" || true)" 0
+	equal "$(pgrep -fc -- "--id $A " || true)" 0
 job pause "$A"
 check "pausing a paused orb changes nothing" equal "$(state "$A")" paused
 sleep 3
@@ -112,7 +116,7 @@ check "another orb cannot reach that service" \
 
 echo "== unusable memory snapshot"
 job pause "$A"
-docker exec "$RUNTIME" sh -c "echo corrupt >/var/lib/fc-orbs/orbs/$A/snap/vmstate"
+echo corrupt | sudo tee "$STATE/jail/firecracker/$A/root/snap/vmstate" >/dev/null
 job spawn "$A" ORB_TOKEN=fifth
 check "orb boots from its disk when the snapshot cannot be loaded" \
 	test "$(guest "$A" 'cat /proc/sys/kernel/random/boot_id')" != "$boot_id"
@@ -123,8 +127,8 @@ job delete "$A"
 job delete "$B"
 job delete "$B"
 check "deleted orbs are gone" equal "$(state "$A")$(state "$B")" ""
-check "their tap devices are gone" \
-	equal "$(docker exec "$RUNTIME" sh -c 'ls /sys/class/net | grep -c orbtap' || true)" \
+check "their network namespaces are gone" \
+	equal "$(ip netns list | grep -c '^orb' || true)" \
 	"$("$ROOT/fc-orb" list | grep -c running || true)"
 
 echo
