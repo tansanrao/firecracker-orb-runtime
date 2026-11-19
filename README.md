@@ -120,6 +120,7 @@ Set these in the provider's environment: run `systemctl --user edit fc-orb-provi
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FC_ORB_VCPUS`, `FC_ORB_MEM_MIB` | `4`, `8192` | Size of an orb whose thread picked no orb type. |
+| `FC_ORB_MEM_RESERVE_MIB` | a tenth of RAM | Memory kept for the host. A spawn fails when the new orb, plus what running orbs can still grow by, would leave less than this available. |
 | `FC_ORB_DISK_GIB` | `64` | Root disk size for orbs created afterwards. The file is sparse. |
 | `FC_ORB_CPUSET` | performance cores, else all | Host CPUs orbs run on, such as `0-15`. On a hybrid Intel CPU the default keeps vCPUs off the efficiency cores. |
 | `ORB_IMAGE` | Amp's orb image | The image new orbs boot from. |
@@ -142,7 +143,9 @@ Then delete the provider under **Settings → Orbs**.
 
 - **One trusted user.** Firecracker runs as root in a container, without its jailer and without per-orb CPU or I/O
   limits. Do not run untrusted code or other people's threads on it.
-- **Running orbs do not return memory.** Each one can grow to its full size on the host until it pauses.
+- **Running orbs do not return memory.** Each one can grow to its full size on the host until it pauses, so a spawn
+  counts every running orb at its full size and fails when the host could not hold them all. The thread's setup log
+  shows how much memory was missing. Archiving idle threads pauses their orbs and frees it.
 - **Pause time follows configured memory.** Firecracker writes all of an orb's memory before the unused part is
   dropped. One 8 GiB orb takes about 5 s; four at once took about 20 s each.
 - **A portal does not wake a sleeping orb.** Amp answers the request itself and sends no job. Send the thread a

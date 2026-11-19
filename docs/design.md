@@ -24,7 +24,8 @@ The host side needs only Docker. The container runs with `--device /dev/kvm`, `-
 **spawn**
 
 1. If Firecracker is already running for the orb, resume it in case a pause was interrupted.
-2. Otherwise, if the orb has a valid memory snapshot, start Firecracker and load it.
+2. Otherwise check that the host has the memory for it (see [Host memory](#host-memory)). If it has, and the orb has a
+   valid memory snapshot, start Firecracker and load it.
 3. Otherwise boot from the orb's disk. A new orb first gets a disk: a copy of the project snapshot named by
    `ORB_SNAPSHOT_ID` if the runtime has it, else a copy of the image's base disk.
 4. Set the guest's clock, hostname, and DNS. A restored guest still shows the time it was paused at.
@@ -94,6 +95,22 @@ Firecracker has exited.
 
 Firecracker's threads are pinned to the host's performance cores (`/sys/devices/cpu_core/cpus`). That gives the
 single-thread speed, and it keeps the CPU type the same between snapshot and restore.
+
+## Host memory
+
+A guest never gives memory back, so a running orb can grow to its configured size. Before Firecracker starts, spawn
+adds the new orb's size to what every running orb has not used yet: its configured size minus Firecracker's `RssAnon`,
+which is the guest memory it has written. If that sum, plus `FC_ORB_MEM_RESERVE_MIB` (a tenth of RAM by default), is
+more than the host's `MemAvailable`, the spawn fails with the numbers and leaves the orb's snapshot as it was.
+A restored orb's unwritten pages are file-backed page cache, so they count toward what it can still grow by, not
+toward what it uses. Spawns hold a lock from the check until the guest answers, so concurrent spawns each count the
+orbs the others start. Four new 8 GiB orbs spawned at once with 20 GiB of headroom started two and refused two.
+
+The check does not pause other orbs to make room. The runtime cannot tell an idle orb from one whose agent is
+waiting on a model, and Amp pauses idle orbs itself.
+
+Firecracker runs with `oom_score_adj` 500. User processes, including the provider, run at 200, so otherwise the
+OOM killer would pick them before an orb many times their size. An orb it kills boots from its disk.
 
 ## Network
 

@@ -14,7 +14,7 @@ orbctl() {
 	docker exec -i \
 		--env ORB_ID --env ORB_IMAGE_ID --env ORB_SNAPSHOT_ID --env ORB_TYPE \
 		--env ORB_TOKEN --env AMP_URL \
-		--env FC_ORB_VCPUS --env FC_ORB_MEM_MIB --env FC_ORB_DISK_GIB \
+		--env FC_ORB_VCPUS --env FC_ORB_MEM_MIB --env FC_ORB_MEM_RESERVE_MIB --env FC_ORB_DISK_GIB \
 		--env FC_ORB_CPUSET --env FC_ORB_BOOTSTRAP_CMD \
 		"$FC_ORB_CONTAINER" orbctl "$@"
 }

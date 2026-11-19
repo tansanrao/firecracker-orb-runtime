@@ -289,6 +289,10 @@ def start_firecracker(orb):
     def pin_to_cpus():
         if cpus:
             os.sched_setaffinity(0, cpus)
+        # User processes, such as the provider, run at 200, so without this
+        # the OOM killer takes them before an orb many times their size. An
+        # orb it kills boots from its disk, as after a power loss.
+        Path("/proc/self/oom_score_adj").write_text("500")
 
     firecracker_id = re.sub(r"[^A-Za-z0-9-]", "-", orb.id)
     log_path = orb.dir / "fc.log"
@@ -518,18 +522,60 @@ fi
         raise OrbError(f"starting the bootstrap in {orb.id} failed: {output.strip()}")
 
 
+def meminfo():
+    """The host's /proc/meminfo in MiB; a container sees the host's values."""
+    fields = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        name, value = line.split(":", 1)
+        fields[name] = int(value.split()[0]) // 1024
+    return fields
+
+
+def admit(orb):
+    """Refuses to start an orb unless the host can hold all of its memory.
+
+    A running orb never returns memory, so each can still grow to its full
+    size: what it has not written yet (Firecracker's anonymous memory) is
+    counted as taken. Starting orbs past that point would let the host's OOM
+    killer pick an orb, the provider, or dockerd once they grow.
+    """
+    host = meminfo()
+    reserve = int(os.environ.get("FC_ORB_MEM_RESERVE_MIB") or host["MemTotal"] // 10)
+    growth = 0
+    for other in all_orbs():
+        pid = other.pid()
+        if pid is None or other.id == orb.id:
+            continue
+        with contextlib.suppress(OSError, ValueError):
+            status = Path(f"/proc/{pid}/status").read_text()
+            written = int(re.search(r"^RssAnon:\s+(\d+)", status, re.M).group(1)) // 1024
+            growth += max(other.config["memory_mib"] - written, 0)
+    needed = orb.config["memory_mib"]
+    if needed + growth + reserve > host["MemAvailable"]:
+        raise OrbError(
+            f"not enough host memory to start {orb.id}: it needs {needed} MiB and running orbs can still grow by "
+            f"{growth} MiB, but the host has {host['MemAvailable']} MiB available and keeps {reserve} MiB for "
+            "itself (FC_ORB_MEM_RESERVE_MIB). Archive threads you are done with, or wait for idle orbs to pause."
+        )
+
+
 def spawn(orb):
     started = time.monotonic()
     if orb.pid() is not None:
         orb.api("PATCH", "/vm", {"state": "Resumed"})  # in case a pause was interrupted
         how = "was already running"
-    elif orb.snapshot_marker.exists() and restore(orb):
-        how = "restored from memory snapshot"
     else:
         if not orb.rootfs.exists():
             create(orb)
-        cold_boot(orb)
-        how = "booted from disk"
+        # Held until Firecracker runs, so concurrent spawns each count the
+        # orbs the others start.
+        with locked("memory"):
+            admit(orb)
+            if orb.snapshot_marker.exists() and restore(orb):
+                how = "restored from memory snapshot"
+            else:
+                cold_boot(orb)
+                how = "booted from disk"
     prepare_guest(orb)
     bootstrap(orb)
     config = orb.config
