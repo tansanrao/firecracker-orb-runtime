@@ -454,6 +454,12 @@ def stop_firecracker(orb):
 
 
 # Replaced whole on every spawn, so a newer runtime's rules take effect.
+# Every IPv4 range that is not the public internet (RFC 6890).
+NON_PUBLIC_NETWORKS = [
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+    "203.0.113.0/24", "224.0.0.0/3",
+]
 FIREWALL = f"""
 table inet fc_orbs
 delete table inet fc_orbs
@@ -462,6 +468,12 @@ table inet fc_orbs {{
         type filter hook forward priority filter; policy accept;
         # One orb cannot reach another.
         iifname "vorb*" oifname "vorb*" drop
+        # Nor any private or special-purpose network: the LAN, Tailscale,
+        # the host's VMs, link-local and cloud metadata addresses. Rejected,
+        # so a connection fails at once rather than timing out.
+        iifname "vorb*" ip daddr {{ {", ".join(NON_PUBLIC_NETWORKS)} }} reject with icmpx admin-prohibited
+        # Orbs have no IPv6, and the host forwards it, so drop any they send.
+        iifname "vorb*" meta nfproto ipv6 drop
     }}
     chain input {{
         type filter hook input priority filter; policy accept;
@@ -650,8 +662,9 @@ def prepare_guest(orb):
             continue
         with contextlib.suppress(ValueError):
             address = ipaddress.ip_address(fields[1])
-            # The guest has no IPv6 and cannot reach the host's loopback.
-            if address.version == 4 and not address.is_loopback:
+            # The guest has no IPv6, and the firewall keeps it off private
+            # networks, such as a home router's DNS or Tailscale's.
+            if address.version == 4 and address.is_global:
                 nameservers.append(fields[1])
     resolv_conf = "".join(f"nameserver {server}\n" for server in nameservers or FALLBACK_DNS)
     hosts = f"127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n127.0.1.1 {orb.id}\n"

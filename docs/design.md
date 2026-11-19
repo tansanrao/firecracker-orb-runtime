@@ -213,8 +213,12 @@ OOM killer would pick them before an orb many times their size. An orb it kills 
 Each orb has a network namespace `orb<slot>`. In it, the orb's tap device, owned by the orb's user, is the guest's
 gateway on a /30 from `10.213.0.0/16`. A veth pair (`vorb<slot>` on the host) on a /30 from `10.214.0.0/16` joins the
 namespace to the host, which routes the orb's /30 to it. The `inet fc_orbs` nftables table masquerades orb traffic
-out of the host, drops traffic between orbs, and drops what orbs send to the host itself, so they reach the internet
-and the LAN but none of the host's own addresses. `orbctl` replaces the table on every spawn.
+out of the host and drops traffic between orbs and to the host's own addresses. It also refuses what orbs send to
+any non-public IPv4 range (`NON_PUBLIC_NETWORKS` in `orbctl`): the LAN, Tailscale's `100.64.0.0/10`, libvirt and
+Multipass networks, and link-local and metadata addresses. Refusing rather than dropping makes such a connection
+fail at once. Guests have no IPv6, but the host forwards it, so the table drops IPv6 from orbs. Orbs get only the
+host's public DNS servers, else `1.1.1.1` and `8.8.8.8`, since a private resolver such as a home router's is out of
+reach. `orbctl` replaces the table on every spawn.
 
 The namespace is deleted on pause and recreated on spawn, with the tap's MAC address derived from its IP. Without
 that, a restored guest keeps sending to the old gateway MAC from its neighbor cache and has no network until the entry
@@ -252,9 +256,9 @@ kernels in Firecracker's CI bucket, which have no release channel or checksum.
 
 ## What was tested
 
-`scripts/smoke-test.sh` makes 26 checks. Across a pause it confirms the same kernel boot ID, the same PID still
+`scripts/smoke-test.sh` makes 27 checks. Across a pause it confirms the same kernel boot ID, the same PID still
 counting, working network, and a correct clock. It also covers repeated jobs, project snapshots, isolation between
-orbs, and booting from disk when a memory snapshot cannot be loaded.
+orbs and from the LAN, and booting from disk when a memory snapshot cannot be loaded.
 
 A real project ran on it through Amp: a six-container Docker Compose stack with Postgres, a Swift backend, and a web
 frontend. In that orb:
@@ -293,3 +297,7 @@ Image refresh: with `debian:stable-slim` retagged to bookworm and an orb running
 built its 8 GiB disk. A new orb got trixie, the old orb kept bookworm across a pause, and garbage collection then
 deleted bookworm's disk and image. The same pass picked up a real update of Amp's image in 43 s. A refresh with no
 change took 2.6 s.
+
+Egress: before the block, an orb opened SSH connections to another host on the campus network and to a Tailscale
+peer. After it, those, the gateway, a Multipass VM, and `169.254.169.254` were all refused at once, while GitHub,
+PyPI, `1.1.1.1`, and the host's DNS servers worked. The smoke test's LAN check fails against the previous firewall.

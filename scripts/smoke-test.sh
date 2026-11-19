@@ -113,6 +113,10 @@ a_ip="$(guest_ip "$A")"
 check "an orb reaches its own service" guest "$A" "curl -fsS -m 3 -o /dev/null http://$a_ip:8000/"
 check "another orb cannot reach that service" \
 	bash -c "! '$ROOT/fc-orb' exec --user user '$B' 'curl -fsS -m 3 -o /dev/null http://$a_ip:8000/' 2>/dev/null"
+# The firewall refuses private networks; a router would at most refuse the port.
+gateway="$(ip -4 route show default | awk '{ print $3; exit }')"
+check "an orb cannot reach the LAN ($gateway)" \
+	bash -c "'$ROOT/fc-orb' exec --user user '$A' 'timeout 3 bash -c \"exec 3<>/dev/tcp/$gateway/80\"' 2>&1 | grep -q 'No route to host'"
 
 echo "== unusable memory snapshot"
 job pause "$A"

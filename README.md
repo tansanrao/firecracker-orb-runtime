@@ -158,7 +158,8 @@ Then delete the provider under **Settings → Orbs**.
 ## Known limits
 
 - **One trusted user.** Each orb is jailed and capped, but `orbctl` runs as root for anyone in the sudo rule, there
-  is no AppArmor profile yet, orbs can reach the LAN, and there are no I/O limits. Do not run other people's threads
+  is no AppArmor profile yet, and there are no I/O limits. Orbs reach only the public internet, which on a network
+  with public addresses, such as a campus, includes its other hosts. Do not run other people's threads
   on it.
 - **Running orbs return freed memory, but not their page cache.** After a process in an orb exits, the host gets its
   memory back at about 250 MiB/s. Files the orb has read stay cached in it until the host runs short of memory, when
