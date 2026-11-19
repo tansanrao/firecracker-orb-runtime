@@ -1,0 +1,35 @@
+#!/bin/bash
+# PID 1 inside a Firecracker orb (kernel boot argument init=/sbin/orb-init).
+#
+# The kernel has already mounted the root disk and configured eth0 from its
+# ip= boot argument. An image with systemd, such as Amp's orb image, boots
+# systemd, which runs orb-agent as a service; that is what makes `systemctl`
+# and Docker work in the orb. Any other image is a plain container image with
+# no init system, so this mounts what a container runtime would have mounted
+# and hands PID 1 to orb-agent.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+mountpoint -q /proc || mount -t proc proc /proc
+
+# File watchers in dev servers and editors need far more than the kernel default.
+echo 524288 >/proc/sys/fs/inotify/max_user_watches
+echo 8192 >/proc/sys/fs/inotify/max_user_instances
+
+if [[ -x /lib/systemd/systemd && -e /etc/systemd/system/orb-agent.service ]]; then
+	exec /lib/systemd/systemd
+fi
+
+mountpoint -q /sys || mount -t sysfs sysfs /sys
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts -o gid=5,mode=620,ptmxmode=666
+mount -t tmpfs shm /dev/shm -o mode=1777,nosuid,nodev
+mount -t tmpfs run /run -o mode=755,nosuid,nodev
+mkdir -p /run/lock
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+ln -sfn /proc/self/fd /dev/fd
+ln -sfn /proc/self/fd/0 /dev/stdin
+ln -sfn /proc/self/fd/1 /dev/stdout
+ln -sfn /proc/self/fd/2 /dev/stderr
+
+exec /usr/local/sbin/orb-agent

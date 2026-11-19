@@ -1,0 +1,16 @@
+# Runs orb-agent in an orb image that boots systemd (Amp's orb image does).
+# orbctl installs and enables this unit when it builds an image's root disk.
+[Unit]
+Description=Firecracker orb agent (runs scripts the host sends over vsock)
+
+[Service]
+ExecStart=/usr/local/sbin/orb-agent
+Restart=always
+RestartSec=1
+# What the agent starts, such as `amp orb bootstrap`, outlives a restart of it.
+KillMode=process
+# The limit a container runtime grants; everything the agent starts inherits it.
+LimitNOFILE=65536:1048576
+
+[Install]
+WantedBy=multi-user.target

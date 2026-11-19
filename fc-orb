@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Operator commands for the Firecracker orb runtime.
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: fc-orb <command>
+
+  setup [image]         Build the runtime, (re)start it, and prepare the orb image's disk.
+                        Running orbs are paused first and wake on their next spawn.
+  install-service       Run `amp orb provider` as a systemd user service that starts at boot
+                        and restarts if it exits. Safe to run again after moving this directory.
+  list                  List orbs and whether each is running, paused, or stopped.
+  exec [--user U] <orb> <script>
+                        Run a bash script inside a running orb.
+  console <orb>         Print the orb's serial console and Firecracker log.
+  pause-all             Snapshot and stop every running orb.
+  destroy               Remove the runtime container and ALL orbs, disks, and snapshots.
+EOF
+}
+
+DEFAULT_ORB_IMAGE=us-central1-docker.pkg.dev/amp-prod-0/amp-orb/amp-orb:latest
+PROVIDER_SERVICE=fc-orb-provider.service
+
+case "${1:-}" in
+	setup)
+		build_runtime
+		wanted="$(docker image inspect --format '{{.Id}}' "$FC_ORB_RUNTIME_IMAGE")"
+		current="$(docker inspect --format '{{.Image}}' "$FC_ORB_CONTAINER" 2>/dev/null || true)"
+		if [[ -n "$current" && "$current" != "$wanted" ]]; then
+			# `docker stop` makes `orbctl serve` snapshot the running orbs.
+			docker stop "$FC_ORB_CONTAINER" >/dev/null
+			docker rm "$FC_ORB_CONTAINER" >/dev/null
+		fi
+		ensure_runtime
+		ensure_image "${2:-${ORB_IMAGE:-$DEFAULT_ORB_IMAGE}}" >/dev/null
+		echo "Runtime ready. Run the provider with: $FC_ORB_ROOT/fc-orb install-service"
+		;;
+	install-service)
+		amp="$(command -v amp)" || { echo "amp is not on PATH" >&2; exit 1; }
+		unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$PROVIDER_SERVICE"
+		mkdir -p "$(dirname "$unit")"
+		# The provider reads its token from the Amp credentials that
+		# `amp orb provider create` saved, so the unit holds no secret.
+		# Settings such as FC_ORB_VCPUS go in a drop-in:
+		# systemctl --user edit fc-orb-provider
+		cat >"$unit" <<EOF
+[Unit]
+Description=Amp orb provider for Firecracker orbs
+Documentation=https://ampcode.com/docs/orbs/self-hosted
+# Never give up restarting: at boot the network may not be up yet.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment="PATH=$(dirname "$amp"):/usr/local/bin:/usr/bin:/bin"
+ExecStart="$amp" orb provider "$FC_ORB_ROOT/dispatch.sh"
+Restart=always
+RestartSec=5
+# On stop the provider waits for its running jobs, so signal only the provider
+# and give a job the five minutes Amp allows it.
+KillMode=mixed
+TimeoutStopSec=300
+
+[Install]
+WantedBy=default.target
+EOF
+		systemctl --user daemon-reload
+		systemctl --user enable --quiet "$PROVIDER_SERVICE"
+		systemctl --user restart "$PROVIDER_SERVICE"
+		echo "Installed and started $unit"
+		if [[ "$(loginctl show-user "$USER" --property Linger --value 2>/dev/null)" != yes ]]; then
+			echo "It starts when you log in. To start it at boot, run: loginctl enable-linger $USER"
+		fi
+		;;
+	list)
+		ensure_runtime
+		orbctl list
+		;;
+	exec)
+		shift
+		ensure_runtime
+		orbctl exec "$@"
+		;;
+	console)
+		ensure_runtime
+		docker exec "$FC_ORB_CONTAINER" sh -c 'cd "/var/lib/fc-orbs/orbs/$1" && cat console.log fc.log' sh "$2"
+		;;
+	pause-all)
+		ensure_runtime
+		orbctl pause-all
+		;;
+	destroy)
+		docker rm --force "$FC_ORB_CONTAINER" >/dev/null 2>&1 || true
+		docker volume rm "$FC_ORB_VOLUME" >/dev/null 2>&1 || true
+		echo "Removed the runtime container and the $FC_ORB_VOLUME volume."
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac
