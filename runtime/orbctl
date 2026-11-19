@@ -85,11 +85,28 @@ def run(*command):
     return result.stdout
 
 
+def fsync(*paths):
+    """Waits until the files or directories at paths are on stable storage.
+
+    A rename or a new file is durable only once its directory is synced, and
+    a file's data only once the file is: without both, a power loss can leave
+    a name pointing at a file whose contents were never written.
+    """
+    for path in paths:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def clone_file(source, destination):
     """Copies a disk image; on btrfs or XFS this is a constant-time reflink."""
     temporary = destination.with_name(destination.name + ".tmp")
     run("cp", "--reflink=auto", "--sparse=always", str(source), str(temporary))
+    fsync(temporary)
     temporary.rename(destination)
+    fsync(destination.parent)
 
 
 def storage_key(identifier):
@@ -381,7 +398,8 @@ def create(orb):
 
 def cold_boot(orb):
     config = orb.config
-    shutil.rmtree(orb.snap, ignore_errors=True)
+    for stale in (orb.snap, orb.dir / "snap.new"):
+        shutil.rmtree(stale, ignore_errors=True)
     ensure_network(orb)
     start_firecracker(orb)
     boot_args = (
@@ -417,7 +435,10 @@ def cold_boot(orb):
 
 def restore(orb):
     """Resumes the orb from its memory snapshot. Returns False if that failed."""
+    # If the marker came back after a power loss, the guest's disk writes
+    # from this run would be under a memory snapshot that predates them.
     orb.snapshot_marker.unlink()
+    fsync(orb.snap)
     try:
         ensure_network(orb)
         start_firecracker(orb)
@@ -526,23 +547,31 @@ def save_project_snapshot(orb, snapshot_id):
         staging.mkdir(parents=True)
         clone_file(orb.rootfs, staging / "rootfs.ext4")
         (staging / "image.json").write_text(json.dumps(orb.config["image"]))
+        fsync(staging / "image.json", staging)
         shutil.rmtree(target, ignore_errors=True)
         staging.rename(target)
+        fsync(target.parent)
     log(f"saved project snapshot {snapshot_id} from {orb.id}")
 
 
-def make_durable(snapshot):
-    """Shrinks a new snapshot to the memory the guest used and syncs it to disk.
+def make_durable(orb, snapshot):
+    """Makes a new memory snapshot and the disk it belongs with durable, then
+    marks the snapshot restorable.
 
     Firecracker writes all of the guest's memory, mostly zeros for an orb that
     used a fraction of it. Punching those out before the data is written back
     keeps a sleeping orb's footprint, and the time to pause it, proportional
     to the memory it used.
+
+    The guest's last disk writes may still be in the host's page cache, and
+    the marker must not reach the disk before them or before the memory: a
+    power loss would then leave a snapshot that restores over a disk older
+    than its memory, which corrupts the guest's filesystem.
     """
     subprocess.run(["fallocate", "--dig-holes", str(snapshot / "mem")], capture_output=True)
-    for name in ("mem", "vmstate"):
-        with open(snapshot / name, "rb") as handle:
-            os.fsync(handle.fileno())
+    fsync(snapshot / "mem", snapshot / "vmstate", orb.rootfs)
+    (snapshot / "valid").touch()
+    fsync(snapshot)
 
 
 def pause(orb):
@@ -573,7 +602,7 @@ def pause(orb):
                 timeout=270,
             )
             stop_firecracker(orb)
-            make_durable(staging)
+            make_durable(orb, staging)
             saved = True
         except (OrbError, OSError) as error:
             log(f"could not snapshot {orb.id} ({error}); stopping it with its disk only")
@@ -582,7 +611,7 @@ def pause(orb):
         shutil.rmtree(orb.snap, ignore_errors=True)
         if saved:
             staging.rename(orb.snap)
-            orb.snapshot_marker.touch()
+            fsync(orb.dir)
             size_mib = (orb.snap / "mem").stat().st_blocks * 512 // 2**20
             log(f"{orb.id} paused in {time.monotonic() - started:.2f}s ({size_mib} MiB of memory saved)")
         else:
@@ -667,8 +696,10 @@ def command_import_image(arguments):
     run("mkfs.ext4", "-q", "-F", "-L", "orbroot", "-m", "0", "-d", str(root), str(disk))
     shutil.rmtree(root)
     (staging / "image.json").write_text(arguments.image_config)
+    fsync(disk, staging / "image.json", staging)
     shutil.rmtree(target, ignore_errors=True)
     staging.rename(target)
+    fsync(target.parent)
     log(f"imported image {arguments.image_id[:19]} as a {disk_gib()} GiB root disk")
 
 
@@ -696,6 +727,8 @@ def command_exec(arguments):
 
 
 def pause_all():
+    # One at a time: pauses are bound by the disk, so four at once took as
+    # long in total as four in a row, and each took four times as long.
     for orb in all_orbs():
         with locked(orb.id):
             if orb.pid() is not None:

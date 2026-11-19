@@ -21,7 +21,7 @@ It is built for one trusted user on one host. See [Known limits](#known-limits) 
 ## Requirements
 
 - Linux x86-64 with KVM (`/dev/kvm`).
-- Docker, and a user who can run it. Nothing else needs root.
+- Docker, and a user who can run it. Nothing else needs root, apart from installing the shutdown hook.
 - The `amp` CLI, signed in.
 - A filesystem with reflinks (btrfs or XFS) under Docker's data directory, so that creating an orb's disk is instant.
   Other filesystems work and copy the disk instead.
@@ -58,6 +58,14 @@ packages are installed on the host and its network configuration is not changed.
    loginctl enable-linger "$USER"      # start it at boot, without a login
    ```
 
+   Then install the shutdown hook, the one step that uses `sudo`. It is a system unit that pauses running orbs before
+   Docker stops, at shutdown or when Docker restarts or is upgraded. Without it, systemd gives Docker 90 s to stop,
+   and orbs that have not finished pausing by then lose their processes.
+
+   ```bash
+   ./fc-orb install-shutdown-hook
+   ```
+
 5. Start a thread on it. In the composer, open **Orb** and choose the provider under **Self-Hosted**, or:
 
    ```bash
@@ -87,8 +95,8 @@ journalctl --user -u fc-orb-provider -f          # its log: every job, and the r
 An orb's ID is `amp-` followed by its thread ID without the `T-`.
 
 `docker stop fc-orb-runtime` snapshots the running orbs first, and they resume from memory on their next message.
-That message waits about 35 s, because Amp did not know the orb was asleep. The container has a 300 s stop timeout so
-that a host shutdown can do the same; that path is untested.
+That message waits about 35 s, because Amp did not know the orb was asleep. The shutdown hook does the same at a host
+reboot or a Docker restart, and the container, the hook, and the provider all start again at boot.
 
 ## Updating
 
@@ -143,5 +151,5 @@ Then delete the provider under **Settings → Orbs**.
   orb's disk keeps the size it was created with.
 - **Open connections do not survive a long sleep.** Processes resume, but the other end of a TCP connection will have
   hung up.
-- **Untested:** a host reboot, Amp saving and reusing a project snapshot, and stopping the provider during a job.
+- **Untested:** Amp saving and reusing a project snapshot, and stopping the provider during a job.
 - **x86-64 only.**
