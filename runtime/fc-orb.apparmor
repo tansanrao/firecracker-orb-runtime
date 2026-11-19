@@ -1,0 +1,73 @@
+# AppArmor profiles for the jailer and the Firecracker it starts for each orb.
+# `fc-orb setup` installs this as /etc/apparmor.d/fc-orb.
+#
+# They are a layer under the jailer's own confinement (chroot, an unprivileged
+# user per orb, namespaces, and Firecracker's seccomp filters): a Firecracker
+# taken over from inside a guest may still touch only its own chroot.
+#
+# Paths after the jailer's pivot_root are relative to the orb's chroot, such
+# as /rootfs.ext4; attach_disconnected names them that way.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile fc-orb-jailer /opt/fc-orb/bin/jailer flags=(attach_disconnected) {
+  # Builds the chroot as root, then drops to the orb's user.
+  capability chown,
+  capability dac_override,
+  capability dac_read_search,
+  capability fowner,
+  capability fsetid,
+  capability mknod,
+  capability setgid,
+  capability setuid,
+  capability sys_admin,
+
+  /opt/fc-orb/bin/jailer mr,
+  /opt/fc-orb/bin/firecracker r,
+  /proc/misc r,
+  @{PROC}/@{pid}/{cgroup,mounts} r,
+  /sys/fs/cgroup/** r,
+  /run/netns/orb* r,
+
+  /var/lib/fc-orbs/jail/ r,
+  /var/lib/fc-orbs/jail/firecracker/*/root/ r,
+  /var/lib/fc-orbs/jail/firecracker/*/root/firecracker rw,
+  /var/lib/fc-orbs/jail/firecracker/*/root/old_root/ w,
+  mount options=(rw, rslave) -> /,
+  mount options=(rw, rbind) /var/lib/fc-orbs/jail/firecracker/*/root/ -> /var/lib/fc-orbs/jail/firecracker/*/root/,
+  pivot_root oldroot=/var/lib/fc-orbs/jail/firecracker/*/root/old_root/ /var/lib/fc-orbs/jail/firecracker/*/root/,
+
+  # Inside the chroot, after pivot_root.
+  umount /old_root/,
+  /old_root/ w,
+  / rw,
+  /{dev,run}/ w,
+  /dev/net/ w,
+  /dev/{kvm,urandom,userfaultfd} w,
+  /dev/net/tun w,
+  /firecracker.pid w,
+  /firecracker Px -> fc-orb-firecracker,
+}
+
+profile fc-orb-firecracker flags=(attach_disconnected) {
+  /firecracker mr,
+  /dev/null r,
+  /dev/kvm rw,
+  /dev/net/tun rw,
+  /dev/urandom r,
+
+  /vmlinux r,
+  /rootfs.ext4 rwk,
+  /fc.log rw,
+  /snap/{mem,vmstate} r,
+  /snap.new/{mem,vmstate} rw,
+
+  # The API socket orbctl talks to, and the vsock socket to the guest agent.
+  /{fc,v}.sock rw,
+  unix (create, bind, listen, accept, connect, send, receive, getattr, getopt, setopt, shutdown) type=stream,
+
+  # Its threads signal each other, and orbctl's systemctl kill stops it.
+  signal (send, receive) set=(rtmin+3) peer=fc-orb-firecracker,
+  signal (receive) peer=unconfined,
+}

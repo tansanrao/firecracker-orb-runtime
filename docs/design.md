@@ -33,6 +33,11 @@ Each orb's Firecracker runs under Firecracker's jailer, in a transient systemd u
 - **Namespaces:** a new mount namespace, a new PID namespace in which Firecracker is PID 1, and the orb's network
   namespace.
 - **Seccomp:** Firecracker's default filters, which are built in.
+- **AppArmor:** `runtime/fc-orb.apparmor`, installed as `/etc/apparmor.d/fc-orb`, holds two enforcing profiles. The
+  jailer's allows only building the chroot: the device nodes, the bind mount and `pivot_root`, and chowning to the
+  orb's user. It execs `/firecracker` into the second profile, which allows `/dev/kvm`, `/dev/net/tun`, the kernel,
+  the disk, the snapshot files, the log, and the two sockets, all in the chroot, and nothing else: no network
+  sockets, no other files, no exec. The rules are what an audit-everything profile logged across the smoke test.
 - **Caps:** `CPUQuota` of the orb's vCPUs × 100%, `CPUWeight` proportional to them, `MemoryMax` of guest memory plus
   256 MiB, `MemorySwapMax=infinity`, and `OOMScoreAdjust=500`. Orbs run on every host CPU unless `FC_ORB_CPUSET` names some (`AllowedCPUs`).
 - **Stop:** PID 1 ignores SIGTERM, so the unit is stopped with SIGKILL. A pause has saved the orb by then.
@@ -301,3 +306,7 @@ change took 2.6 s.
 Egress: before the block, an orb opened SSH connections to another host on the campus network and to a Tailscale
 peer. After it, those, the gateway, a Multipass VM, and `169.254.169.254` were all refused at once, while GitHub,
 PyPI, `1.1.1.1`, and the host's DNS servers worked. The smoke test's LAN check fails against the previous firewall.
+
+AppArmor: the smoke test passed with both profiles enforcing and logged no denials, and Firecracker ran as
+`fc-orb-firecracker (enforce)`. A root process switched to that profile could open `/dev/kvm` but not read
+`/etc/shadow` or another orb's disk, write `/tmp`, open an IPv4 socket, or exec `/bin/sh`.

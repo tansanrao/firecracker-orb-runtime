@@ -117,7 +117,7 @@ resume from memory on their next message. That message waits about 35 s, because
 | This repository's code | `./fc-orb setup`. Running orbs keep running; the next job uses the new `orbctl`. |
 | Guest kernel | Set `KERNEL_COMMIT` in `runtime/Containerfile` to the commit of the newest `kernel6.18-*` tag (the command is in a comment there), then `./fc-orb setup` and `./scripts/smoke-test.sh`. |
 | Kernel options | Add them to `runtime/guest/kernel.config`. The build fails if an option does not take effect. |
-| Firecracker | Set `FIRECRACKER_VERSION`, `FIRECRACKER_SHA256`, and `FIRECRACKER_COMMIT` in `runtime/Containerfile`. Memory snapshots from another version may not load; those orbs boot from disk and keep their files. |
+| Firecracker | Set `FIRECRACKER_VERSION`, `FIRECRACKER_SHA256`, and `FIRECRACKER_COMMIT` in `runtime/Containerfile`. Memory snapshots from another version may not load; those orbs boot from disk and keep their files. If the smoke test fails, check `sudo journalctl -k \| grep 'apparmor="DENIED"'` for something the new version needs in `runtime/fc-orb.apparmor`. |
 | Orb image | Automatic: `fc-orbd` pulls each orb image every hour and builds a disk for a new version, so new orbs start from it. `./fc-orb refresh-images` does it now. Existing orbs keep the image they started from. To pin a version, set `ORB_IMAGE` to a reference by digest. |
 
 The guest kernel is Amazon Linux 2023's `kernel6.18` source built with Firecracker's own microVM config, which is the
@@ -157,10 +157,9 @@ Then delete the provider under **Settings → Orbs**.
 
 ## Known limits
 
-- **One trusted user.** Each orb is jailed and capped, but `orbctl` runs as root for anyone in the sudo rule, there
-  is no AppArmor profile yet, and there are no I/O limits. Orbs reach only the public internet, which on a network
-  with public addresses, such as a campus, includes its other hosts. Do not run other people's threads
-  on it.
+- **One trusted user.** Each orb is jailed, confined by AppArmor, and capped, but `orbctl` runs as root for anyone in
+  the sudo rule, and there are no I/O limits. Orbs reach only the public internet, which on a network with public
+  addresses, such as a campus, includes its other hosts. Do not run other people's threads on it.
 - **Running orbs return freed memory, but not their page cache.** After a process in an orb exits, the host gets its
   memory back at about 250 MiB/s. Files the orb has read stay cached in it until the host runs short of memory, when
   `fc-orbd` asks the guests with the most cache to drop it. Past that, orb memory goes to swap: a heavily swapped orb

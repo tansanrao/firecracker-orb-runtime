@@ -55,6 +55,9 @@ install_runtime() {
 	sudo install -m 0755 "$staging/out/orb-agent" "$ROOT/runtime/guest/orb-init" "$INSTALL/guest/"
 	sudo install -m 0644 "$ROOT/runtime/guest/orb-agent.service" "$INSTALL/guest/"
 	rm -rf "$staging"
+	# Confines the jailer and each orb's Firecracker; loaded again at boot.
+	sudo install -m 0644 "$ROOT/runtime/fc-orb.apparmor" /etc/apparmor.d/fc-orb
+	sudo apparmor_parser --replace /etc/apparmor.d/fc-orb
 
 	# Lets this user, and so the provider, run orbctl as root without a
 	# password, and nothing else.
@@ -149,6 +152,8 @@ EOF
 		orbctl delete-all
 		sudo systemctl disable --now --quiet fc-orbd.service || true
 		sudo rm -f /etc/systemd/system/fc-orbd.service /etc/sudoers.d/fc-orb
+		sudo apparmor_parser --remove /etc/apparmor.d/fc-orb 2>/dev/null || true
+		sudo rm -f /etc/apparmor.d/fc-orb
 		sudo rm -rf "$INSTALL" /var/lib/fc-orbs
 		sudo systemctl daemon-reload
 		echo "Removed all orbs, /var/lib/fc-orbs, and $INSTALL."
