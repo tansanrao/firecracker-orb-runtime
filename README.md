@@ -118,7 +118,7 @@ resume from memory on their next message. That message waits about 35 s, because
 | Guest kernel | Set `KERNEL_COMMIT` in `runtime/Containerfile` to the commit of the newest `kernel6.18-*` tag (the command is in a comment there), then `./fc-orb setup` and `./scripts/smoke-test.sh`. |
 | Kernel options | Add them to `runtime/guest/kernel.config`. The build fails if an option does not take effect. |
 | Firecracker | Set `FIRECRACKER_VERSION`, `FIRECRACKER_SHA256`, and `FIRECRACKER_COMMIT` in `runtime/Containerfile`. Memory snapshots from another version may not load; those orbs boot from disk and keep their files. |
-| Orb image | `sudo podman pull` the image, then `./fc-orb setup`. The runtime never pulls an image it already has. Existing orbs keep the image they started from. |
+| Orb image | Automatic: `fc-orbd` pulls each orb image every hour and builds a disk for a new version, so new orbs start from it. `./fc-orb refresh-images` does it now. Existing orbs keep the image they started from. To pin a version, set `ORB_IMAGE` to a reference by digest. |
 
 The guest kernel is Amazon Linux 2023's `kernel6.18` source built with Firecracker's own microVM config, which is the
 pairing Firecracker validates and supports until at least June 2028. A sleeping orb keeps the kernel it booted, because

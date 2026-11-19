@@ -160,14 +160,14 @@ def disk_gib():
     return int(os.environ.get("FC_ORB_DISK_GIB", "64"))
 
 
-def image_dir(image_id):
+def image_dir(image_id, gib=None):
     """The base disk of an orb image as this runtime builds it.
 
     The disk has a size and holds copies of orb-init and orb-agent, so a
     runtime with another size or newer guest files builds a new disk and
     leaves existing orbs as they are.
     """
-    name = f"{image_id.removeprefix('sha256:')}-{guest_files_digest()}-{disk_gib()}g"
+    name = f"{image_id.removeprefix('sha256:')}-{guest_files_digest()}-{gib or disk_gib()}g"
     return STATE / "images" / name
 
 
@@ -985,19 +985,19 @@ def ensure_image(image):
     return image_id
 
 
-def prepare_image(image):
+def prepare_image(image, gib=None):
     with locked("images"):
         if subprocess.run(["podman", "image", "exists", image]).returncode != 0:
             log(f"pulling {image}")
             run("podman", "pull", "--quiet", image)
         image_id = run("podman", "image", "inspect", "--format", "{{.Id}}", image).strip()
-        if not (image_dir(image_id) / "rootfs.ext4").exists():
+        if not (image_dir(image_id, gib) / "rootfs.ext4").exists():
             log(f"building a root disk from {image} (once per image, about a minute)")
             image_config = run("podman", "image", "inspect", "--format", "{{json .Config}}", image)
             container = run("podman", "create", image).strip()
             try:
                 export = subprocess.Popen(["podman", "export", container], stdout=subprocess.PIPE)
-                import_image(image_id, image_config, export.stdout)
+                import_image(image_id, image_config, export.stdout, gib or disk_gib())
                 if export.wait() != 0:
                     raise OrbError(f"podman export of {image} failed")
             finally:
@@ -1005,9 +1005,9 @@ def prepare_image(image):
         return image_id
 
 
-def import_image(image_id, image_config, stream):
+def import_image(image_id, image_config, stream, gib):
     """Builds a base root disk from the files of an exported container."""
-    target = image_dir(image_id)
+    target = image_dir(image_id, gib)
     if (target / "rootfs.ext4").exists():
         return
     staging = target.with_name(target.name + ".tmp")
@@ -1038,7 +1038,7 @@ def import_image(image_id, image_config, stream):
 
     disk = staging / "rootfs.ext4"
     with open(disk, "wb") as handle:
-        handle.truncate(disk_gib() * 2**30)
+        handle.truncate(gib * 2**30)
     run("mkfs.ext4", "-q", "-F", "-L", "orbroot", "-m", "0", "-d", str(root), str(disk))
     shutil.rmtree(root)
     (staging / "image.json").write_text(image_config)
@@ -1046,7 +1046,7 @@ def import_image(image_id, image_config, stream):
     shutil.rmtree(target, ignore_errors=True)
     staging.rename(target)
     fsync(target.parent)
-    log(f"imported image {image_id[:12]} as a {disk_gib()} GiB root disk")
+    log(f"imported image {image_id[:12]} as a {gib} GiB root disk")
 
 
 def command_console(arguments):
@@ -1144,6 +1144,37 @@ def relieve_pressure():
     return asked
 
 
+def refresh_images():
+    """Pulls every orb image again, and builds a base disk for each new
+    version, so the next new orb starts from it without waiting.
+
+    An orb image is a tag with a base disk; the new disk gets the same size.
+    Orbs keep the disks they were created from, and garbage collection then
+    deletes the old base disk. An image pulled by digest never changes.
+    """
+    with locked("images"):
+        listing = run("podman", "images", "--no-trunc", "--filter", "dangling=false",
+                      "--format", "{{.Repository}}:{{.Tag}} {{.ID}}")
+        images = {}
+        for line in listing.splitlines():
+            name, image_id = line.split()
+            disks = (STATE / "images").glob(image_id.removeprefix("sha256:") + "-*g")
+            sizes = {int(path.name.rsplit("-", 1)[1].removesuffix("g")) for path in disks}
+            if sizes and not name.endswith(":<none>"):
+                images[name] = (image_id, sizes)
+    for name, (old_id, sizes) in images.items():
+        # Outside the lock, so spawns are not held up by the download.
+        try:
+            run("podman", "pull", "--quiet", name)
+        except OrbError as error:
+            log(f"could not refresh {name}: {error}")
+            continue
+        for gib in sizes:
+            new_id = prepare_image(name, gib)
+        if new_id.removeprefix("sha256:") != old_id.removeprefix("sha256:"):
+            log(f"refreshed {name}: new orbs start from {new_id.removeprefix('sha256:')[:12]}")
+
+
 def collect_garbage():
     """Deletes what no orb uses and no spawn will: base disks of images the
     host no longer has, or that hold older guest files; dangling images;
@@ -1208,10 +1239,11 @@ def command_serve(arguments):
     next_collection = 0
     while True:
         if time.monotonic() >= next_collection:
-            try:
-                collect_garbage()
-            except (OrbError, OSError) as error:
-                log(f"garbage collection failed: {error}")
+            for step in (refresh_images, collect_garbage):
+                try:
+                    step()
+                except (OrbError, OSError, subprocess.SubprocessError) as error:
+                    log(f"{step.__name__} failed: {error}")
             next_collection = time.monotonic() + 3600
         # Reported pages reach the host at about 250 MiB/s, so after asking,
         # wait for them before judging whether more is needed.
@@ -1240,6 +1272,9 @@ def main():
     commands.add_parser("delete-all", help="delete every orb and its disk").set_defaults(run=command_delete_all)
     commands.add_parser("gc", help="delete unused base disks, images, and project snapshots").set_defaults(
         run=lambda arguments: collect_garbage()
+    )
+    commands.add_parser("refresh-images", help="pull orb images again and build disks for new versions").set_defaults(
+        run=lambda arguments: refresh_images()
     )
     commands.add_parser("serve", help="fc-orbd's main process").set_defaults(run=command_serve)
 

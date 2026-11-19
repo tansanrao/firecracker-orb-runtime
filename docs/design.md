@@ -95,7 +95,12 @@ Orb images are pulled with root's Podman. A base disk is the output of `podman e
 Its directory name includes a hash of those files and the disk size, so a runtime that changes either builds a new
 base disk and leaves existing orbs alone. Disks are copied with `cp --reflink=auto`.
 
-Every hour, and on `./fc-orb gc`, `fc-orbd` deletes what no orb uses and no spawn will:
+A spawn never pulls an image the host has. Instead, every hour (and on `./fc-orb refresh-images`), `fc-orbd` pulls
+each tag that has a base disk again, and when the tag has moved, builds a disk of the same size for the new version.
+New orbs then start from it; existing orbs keep their own disks. A spawn of that image while the new disk is being
+built waits for it. An image pulled by digest has no tag, so it never changes.
+
+Then, and on `./fc-orb gc`, `fc-orbd` deletes what no orb uses and no spawn will:
 
 - base disks whose image is no longer tagged in Podman, or that hold older guest files;
 - dangling Podman images, left when a pull replaces a tag;
@@ -283,3 +288,8 @@ Deadlines, with `FC_ORB_JOB_SECONDS` lowered to force each case:
 
 `./fc-orb gc` deleted the base disk of an untagged image and one built with other guest files, a project snapshot
 untouched for 20 days, and a leftover staging directory. It kept the current base disk and a fresh snapshot.
+
+Image refresh: with `debian:stable-slim` retagged to bookworm and an orb running from it, a refresh pulled trixie and
+built its 8 GiB disk. A new orb got trixie, the old orb kept bookworm across a pause, and garbage collection then
+deleted bookworm's disk and image. The same pass picked up a real update of Amp's image in 43 s. A refresh with no
+change took 2.6 s.

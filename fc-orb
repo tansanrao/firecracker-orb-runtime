@@ -16,8 +16,10 @@ Usage: fc-orb <command>
                         Run a bash script inside a running orb.
   console <orb>         Print the orb's serial console and Firecracker log.
   pause-all             Snapshot and stop every running orb.
+  refresh-images        Pull orb images again and build base disks for new versions, so new
+                        orbs start from them. fc-orbd also does this every hour.
   gc                    Delete unused base disks, images, and project snapshots now. fc-orbd
-                        also does this every hour.
+                        also does this every hour, after refreshing images.
   destroy               Delete ALL orbs, disks, and snapshots, and uninstall the runtime.
 EOF
 }
@@ -135,7 +137,7 @@ EOF
 			echo "It starts when you log in. To start it at boot, run: loginctl enable-linger $USER"
 		fi
 		;;
-	list | pause-all | gc)
+	list | pause-all | refresh-images | gc)
 		orbctl "$1"
 		;;
 	exec | console)
