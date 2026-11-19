@@ -306,19 +306,6 @@ class Orb:
                 time.sleep(0.02)
 
 
-def default_cpuset():
-    """The host's performance cores, or None when it has one kind of core.
-
-    Hybrid Intel CPUs list their performance cores in cpu_core. Keeping vCPUs
-    off the efficiency cores is what gives an orb the host's best
-    single-thread speed.
-    """
-    try:
-        return Path("/sys/devices/cpu_core/cpus").read_text().strip()
-    except OSError:
-        return None
-
-
 def give_to_orb(orb, *paths):
     """Hands files in the chroot to the orb's user, which Firecracker runs as."""
     for path in paths:
@@ -377,7 +364,10 @@ def start_firecracker(orb):
         "StandardOutput": f"append:{orb.dir / 'console.log'}",  # the guest's serial console
         "StandardError": f"append:{orb.dir / 'console.log'}",
     }
-    cpus = os.environ.get("FC_ORB_CPUSET") or default_cpuset()
+    # By default orbs run on every host CPU, P-cores and E-cores alike: the
+    # two kinds share an instruction set, so a snapshot taken on either
+    # restores on the other, and the scheduler moves busy threads to P-cores.
+    cpus = os.environ.get("FC_ORB_CPUSET")
     if cpus:
         properties["AllowedCPUs"] = cpus
     run(
@@ -680,6 +670,18 @@ def written_mib(pid):
     return int(re.search(r"^RssAnon:\s+(\d+)", status, re.M).group(1)) // 1024
 
 
+def allowed_cpus():
+    """The host CPUs orbs run on: FC_ORB_CPUSET, such as 0-15, else all of them."""
+    spec = os.environ.get("FC_ORB_CPUSET")
+    if not spec:
+        return os.sched_getaffinity(0)
+    cpus = set()
+    for part in spec.split(","):
+        first, _, last = part.partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    return cpus
+
+
 def reserve_mib(host):
     """Memory kept free for the host before orbs count as crowding it."""
     return int(os.environ.get("FC_ORB_MEM_RESERVE_MIB") or host["MemTotal"] // 10)
@@ -687,6 +689,8 @@ def reserve_mib(host):
 
 def admit(orb):
     """Refuses to start an orb past the host's memory overcommit limit.
+
+    Also bounds the orbs' vCPUs to FC_ORB_CPU_OVERCOMMIT times the host's CPUs.
 
     Orbs may be configured for up to FC_ORB_MEM_OVERCOMMIT (2) times RAM in
     total, less what the rest of the host uses: the desktop, libvirt VMs,
@@ -710,6 +714,17 @@ def admit(orb):
     others = max(host["MemTotal"] - host["MemAvailable"] - orbs_resident, 0)
     limit = min(ratio * host["MemTotal"], host["MemTotal"] + host["SwapTotal"] - reserve) - others
     needed = orb.config["memory_mib"]
+    # Each orb is capped at its vCPUs, so they can add up to more than the
+    # host's CPUs; this bounds how far, so the host stays usable when all are busy.
+    cpu_ratio = float(os.environ.get("FC_ORB_CPU_OVERCOMMIT") or 4)
+    cpu_limit = cpu_ratio * len(allowed_cpus())
+    vcpus = sum(other.config["vcpus"] for other in all_orbs() if other.id != orb.id and other.pid() is not None)
+    if vcpus + orb.config["vcpus"] > cpu_limit:
+        raise OrbError(
+            f"too many vCPUs to start {orb.id}: it has {orb.config['vcpus']} and running orbs have {vcpus}, but orbs "
+            f"may have {int(cpu_limit)} in total (FC_ORB_CPU_OVERCOMMIT {cpu_ratio:g}x of {len(allowed_cpus())} "
+            "host CPUs). Archive threads you are done with, or wait for idle orbs to pause."
+        )
     if committed + needed > limit:
         raise OrbError(
             f"not enough host memory to start {orb.id}: it needs {needed} MiB and running orbs are configured for "

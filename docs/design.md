@@ -34,7 +34,7 @@ Each orb's Firecracker runs under Firecracker's jailer, in a transient systemd u
   namespace.
 - **Seccomp:** Firecracker's default filters, which are built in.
 - **Caps:** `CPUQuota` of the orb's vCPUs × 100%, `CPUWeight` proportional to them, `MemoryMax` of guest memory plus
-  256 MiB, `MemorySwapMax=infinity`, and `OOMScoreAdjust=500`. `AllowedCPUs` keeps vCPUs on the performance cores.
+  256 MiB, `MemorySwapMax=infinity`, and `OOMScoreAdjust=500`. Orbs run on every host CPU unless `FC_ORB_CPUSET` names some (`AllowedCPUs`).
 - **Stop:** PID 1 ignores SIGTERM, so the unit is stopped with SIGKILL. A pause has saved the orb by then.
 
 Orb units are ordered before `fc-orbd.service`, so at shutdown systemd stops `fc-orbd` first. `fc-orbd` pauses every
@@ -115,8 +115,18 @@ Firecracker maps the memory file privately and loads pages on demand, which is w
 and why the file must stay in place while the orb runs. A new snapshot is written beside it and replaces it only after
 Firecracker has exited.
 
-Firecracker's threads are pinned to the host's performance cores (`/sys/devices/cpu_core/cpus`). That gives the
-single-thread speed, and it keeps the CPU type the same between snapshot and restore.
+## Host CPUs
+
+Orbs run on all 32 threads, performance and efficiency cores alike. On this i9-13900 both kinds report the same CPU
+flags, so a snapshot taken on one restores on the other: an orb booted on the E-cores restored on the P-cores with the
+same boot ID and process, and the reverse too. A lone busy vCPU gets the P-cores' speed from the scheduler: `fib(32)`
+took 0.132 s unpinned, as it did pinned. The same loop took 0.063 s on P-cores and 0.103 s on E-cores.
+
+Each orb's unit caps it at its vCPUs (`CPUQuota`), so orbs' vCPUs may add up to more than the host's threads. A spawn
+is refused past `FC_ORB_CPU_OVERCOMMIT` (4) times the host CPUs, 128 vCPUs here; memory runs out first with 8 GiB
+orbs. Eight 4-vCPU orbs with eight busy processes each used 378% to 396% each, kept the host 96% busy on all 32
+threads, and a short command on the host still took 29 ms. Orbs sit in `fc.slice`, beside `user.slice` and
+`system.slice` at equal CPU weight, so the desktop keeps a share however busy the orbs are.
 
 ## Host memory
 

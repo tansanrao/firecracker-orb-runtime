@@ -135,7 +135,8 @@ Set these in the provider's environment: run `systemctl --user edit fc-orb-provi
 | `FC_ORB_MEM_OVERCOMMIT` | `2` | Orbs may be configured for this many times RAM in total, less what the rest of the host uses, and never more than RAM plus swap less the reserve. A spawn past that fails. |
 | `FC_ORB_MEM_RESERVE_MIB` | a tenth of RAM | Memory kept for the host. Below this much available, `fc-orbd` asks guests to drop file cache. Set it for `fc-orbd` with `sudo systemctl edit fc-orbd` to change that too. |
 | `FC_ORB_DISK_GIB` | `64` | Root disk size for orbs created afterwards. The file is sparse. |
-| `FC_ORB_CPUSET` | performance cores, else all | Host CPUs orbs run on, such as `0-15`. On a hybrid Intel CPU the default keeps vCPUs off the efficiency cores. |
+| `FC_ORB_CPU_OVERCOMMIT` | `4` | Running orbs may have this many times the host's CPUs in vCPUs. Each orb is capped at its own vCPUs. |
+| `FC_ORB_CPUSET` | all | Host CPUs orbs run on, such as `0-15`. By default they use every thread, performance and efficiency cores alike. |
 | `ORB_IMAGE` | Amp's orb image | The image new orbs boot from. |
 
 If you add orb types to the provider in Amp's settings, the names `small` (2 vCPUs, 4 GiB), `medium` (4, 8), `large`
